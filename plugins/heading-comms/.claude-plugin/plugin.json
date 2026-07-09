@@ -1,0 +1,8 @@
+{
+  "name": "heading-comms",
+  "description": "Communication: translate between English and Russian (translate). Reserved (need Exchange/Telegram/session or the send transport): email-intel, telegram, email-draft, email-respond, follow-up.",
+  "author": {
+    "name": "Misha Hanin",
+    "email": "misha.hanin@odinix.com"
+  }
+}

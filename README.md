@@ -31,6 +31,10 @@ plugins, so that is where you install them from. Inside Claude Code:
 | Bundle | What it carries |
 | --- | --- |
 | `heading-core` | Sovereignty and session core: the prime/state-check/checkpoint skills plus the standalone sovereignty guard hooks. |
+| `heading-intel` | Intelligence: parse a document with citations (docparse) and build a web-sourced market brief (market-brief). Reserved (need service creds): osint, x-pulse, yt-pulse, deep-research-advance, notebooklm. |
+| `heading-comms` | Communication: translate between English and Russian (translate). Reserved (need Exchange/Telegram/session or the send transport): email-intel, telegram, email-draft, email-respond, follow-up. |
+| `heading-content` | Content drafting: LinkedIn posts and series, plus image prompts (linkedin-post, linkedin-series, image-prompt). Reserved: flux-image (API key), linkedin-archive (private data). |
+| `heading-ops` | Ops and thinking: draft an implementation plan (create-plan), reason through a hard decision (deep-think), and run a structural editorial pass (editorial-review). Reserved (data/daemon/key-bound): dashboard, radar, queue, sync, next, recall, council. |
 
 Bundles omit a `version`, so each marketplace commit is a new version and
 installs update automatically. Skills call their bundled scripts through

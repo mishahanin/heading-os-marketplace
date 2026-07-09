@@ -1,0 +1,8 @@
+{
+  "name": "heading-intel",
+  "description": "Intelligence: parse a document with citations (docparse) and build a web-sourced market brief (market-brief). Reserved (need service creds): osint, x-pulse, yt-pulse, deep-research-advance, notebooklm.",
+  "author": {
+    "name": "Misha Hanin",
+    "email": "misha.hanin@odinix.com"
+  }
+}

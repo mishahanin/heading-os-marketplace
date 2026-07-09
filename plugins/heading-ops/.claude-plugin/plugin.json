@@ -1,0 +1,8 @@
+{
+  "name": "heading-ops",
+  "description": "Ops and thinking: draft an implementation plan (create-plan), reason through a hard decision (deep-think), and run a structural editorial pass (editorial-review). Reserved (data/daemon/key-bound): dashboard, radar, queue, sync, next, recall, council.",
+  "author": {
+    "name": "Misha Hanin",
+    "email": "misha.hanin@odinix.com"
+  }
+}

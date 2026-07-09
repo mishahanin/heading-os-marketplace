@@ -1,0 +1,8 @@
+{
+  "name": "heading-content",
+  "description": "Content drafting: LinkedIn posts and series, plus image prompts (linkedin-post, linkedin-series, image-prompt). Reserved: flux-image (API key), linkedin-archive (private data).",
+  "author": {
+    "name": "Misha Hanin",
+    "email": "misha.hanin@odinix.com"
+  }
+}
