@@ -1,0 +1,16 @@
+{
+  "name": "heading-os-marketplace",
+  "owner": {
+    "name": "Misha Hanin",
+    "email": "misha.hanin@odinix.com"
+  },
+  "description": "HEADING OS: the operations engine an executive runs their company from, as installable plugin bundles.",
+  "plugins": [
+    {
+      "name": "heading-core",
+      "source": "./plugins/heading-core",
+      "description": "Sovereignty and session core: the prime/state-check/checkpoint skills plus the standalone sovereignty guard hooks.",
+      "category": "heading-os"
+    }
+  ]
+}
