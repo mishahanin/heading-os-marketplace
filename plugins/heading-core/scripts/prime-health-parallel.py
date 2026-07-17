@@ -53,6 +53,8 @@ DISPLAY_ORDER = [
     "sync_exchange_health",
     "odin_cadence",
     "ops_radar",
+    "reminders_due",
+    "dream_shadow",
 ]
 
 # Section banner for each block (matches /prime numbering for legibility)
@@ -66,6 +68,8 @@ SECTION_BANNERS = {
     "sync_exchange_health": "### 2.13 Sync-Exchange Daemon",
     "odin_cadence": "### 2.14 Odin Cadence",
     "ops_radar": "### 2.15 Ops-Radar",
+    "reminders_due": "### 2.16 Durable Reminders",
+    "dream_shadow": "### 2.17 Dream-Shadow",
 }
 
 # Per-check timeout (seconds). Real budget for /prime parallel block.
@@ -387,6 +391,78 @@ def run_ops_radar(workspace_root: Path) -> dict[str, Any]:
     }
 
 
+def run_reminders_due(workspace_root: Path) -> dict[str, Any]:
+    """Read-only: surface due + upcoming durable reminders as a /prime backstop.
+
+    Never mutates the store, never marks fired. ceo-only surface via outputs/;
+    omit_if_empty keeps the brief clean when nothing is due or upcoming.
+    """
+    from datetime import date as _date
+
+    try:
+        from scripts.utils import reminders_store as rs
+        today = _date.today()
+        due = rs.due_records(today)
+        upcoming = rs.upcoming(today, days=7)
+    except Exception as exc:  # noqa: BLE001 - boundary; reported inline
+        return {"status": "error", "output": f"reminders check failed: {exc}",
+                "omit_if_empty": True}
+    lines = []
+    for r in due:
+        lines.append(f"DUE: {r['message']}" + (f"  -> {r['command']}" if r.get("command") else ""))
+    for r in upcoming:
+        when = r["when"] if r["kind"] == "once" else "recurring"
+        lines.append(f"upcoming ({when}): {r['message']}")
+    return {"status": "ok", "output": "\n".join(lines), "omit_if_empty": True}
+
+
+def run_dream_shadow(workspace_root: Path) -> dict[str, Any]:
+    """Read the latest dream-shadow report and surface one line when it lists
+    prune/merge candidates, nothing otherwise.
+
+    Read-only: never runs scripts/dream-shadow.py itself -- that is the
+    nightly timer's job (scripts/install-dream-shadow-timer.sh). This check
+    only reads whatever report already exists under
+    outputs/operations/dream/. Existence-guarded: if no report has been
+    written yet (timer not installed / first run pending), the check is
+    silently skipped, matching the odin_cadence "renders nothing when empty"
+    pattern.
+    """
+    try:
+        report_dir = get_outputs_dir() / "operations" / "dream"
+        reports = sorted(report_dir.glob("*_dream-shadow_report.md"))
+    except Exception as exc:  # noqa: BLE001 - boundary; reported inline
+        return {"status": "error", "output": f"dream-shadow check failed: {exc}",
+                "omit_if_empty": True}
+    if not reports:
+        return {"status": "skipped", "output": "", "omit_if_empty": True}
+
+    latest = reports[-1]
+    try:
+        text = latest.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"status": "error", "output": f"dream-shadow report unreadable: {exc}",
+                "omit_if_empty": True}
+
+    prune_match = re.search(r"## Prune Candidates.*?:\s*(\d+)", text)
+    prune_n = int(prune_match.group(1)) if prune_match else 0
+    merge_section = re.search(r"## Merge Candidates.*?\n\n(.*?)(?:\n---|\Z)", text, re.DOTALL)
+    merge_n = 0
+    if merge_section:
+        merge_n = len(re.findall(r"^- .+<->.+$", merge_section.group(1), re.MULTILINE))
+
+    if prune_n == 0 and merge_n == 0:
+        return {"status": "ok", "output": "", "omit_if_empty": True}
+    return {
+        "status": "ok",
+        "output": (
+            f"Dream-shadow: {prune_n} prune candidates, {merge_n} merge "
+            "candidates -- run `/dream` to review."
+        ),
+        "omit_if_empty": True,
+    }
+
+
 # Map check key -> (callable, friendly label)
 CHECKS = {
     "crm_health": (run_crm_health, "CRM health"),
@@ -398,6 +474,8 @@ CHECKS = {
     "sync_exchange_health": (run_sync_exchange_health, "Sync-Exchange daemon health"),
     "odin_cadence": (run_odin_cadence, "Odin cadence nudge"),
     "ops_radar": (run_ops_radar, "Ops-radar detector"),
+    "reminders_due": (run_reminders_due, "Durable reminders"),
+    "dream_shadow": (run_dream_shadow, "Dream-shadow worklist"),
 }
 
 
