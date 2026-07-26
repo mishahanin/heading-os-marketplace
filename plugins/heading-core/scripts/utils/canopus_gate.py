@@ -18,6 +18,7 @@ freeze is inert without it, because a verification that is never invoked fails
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -92,6 +93,10 @@ class AttestationRecorder:
         self.root_digest: str | None = None
         self.frozen: dict | None = None
         self.patterns: list[str] = ["test_*.py"]
+        # The per-file item counts taken at freeze time by `freeze --contract`.
+        # Empty for a wire 1 freeze, and an absent entry keeps the wire 1
+        # behaviour for that file rather than failing it.
+        self.baseline: dict = {}
         # Deselections arrive BEFORE the tally exists (see deselected below), so
         # they are buffered by root-relative path and folded in on every route
         # that builds or rebuilds self.frozen.
@@ -113,6 +118,7 @@ class AttestationRecorder:
         if manifest is None:
             return None
         self.patterns = config.getini("python_files") or ["test_*.py"]
+        self.baseline = manifest.get("baseline") or {}
         self.root_digest = verify_manifest(manifest, self.root)["recomputed_root"]
         return frozen_test_files(manifest, self.patterns)
 
@@ -231,6 +237,11 @@ class AttestationRecorder:
         tally and its own exit status, and the last writer would win. A worker is
         the only process carrying config.workerinput.
         """
+        if os.environ.get("CANOPUS_NO_ATTEST"):
+            # The contract runner sets this in the child it spawns. `probe` can
+            # run while a freeze is held, and a probe's partial tally must never
+            # overwrite the record left by a real gate run.
+            return False
         if self.frozen is None:
             return False
         if hasattr(session.config, "workerinput"):
@@ -247,5 +258,6 @@ class AttestationRecorder:
             frozen_tests=self.frozen,
             exit_status=int(exitstatus),
             attested_at=datetime.now(timezone.utc).isoformat(),
+            baseline=self.baseline,
         ))
         return True

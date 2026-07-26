@@ -26,12 +26,15 @@ this catches is tampering by helpfulness: the model hits a red assertion,
 concludes in good faith that the assertion is wrong, and edits it. A verification
 that merely runs catches that completely.
 
-Recipe `canopus-freeze-v1`, named in every manifest so a future algorithm change
+Recipe `canopus-freeze-v3`, named in every manifest so a future algorithm change
 breaks loudly instead of silently:
 
     file digest = sha256(LF-normalized bytes)
     dir digest  = sha256("".join(f"{relpath}\\n" for relpath in sorted members))
-    root hash   = sha256(canonical JSON of {recipe, anchor, files, dirs})
+    root hash   = sha256(canonical JSON of {recipe, anchor, files, dirs, baseline})
+
+where a directory's members are those whose BASENAME matches one of the entry's
+recorded `names` patterns.
 
 Per-file bytes are LF-normalized (\\r\\n -> \\n) so a CRLF working copy and a
 fresh LF checkout agree, matching the recipe already proven in
@@ -57,11 +60,60 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 from scripts.utils.atomic import atomic_write_text
 
-RECIPE = "canopus-freeze-v1"
+RECIPE = "canopus-freeze-v3"
 FREEZE_DIRNAME = ".canopus"
 FREEZE_FILENAME = "freeze.json"
 HISTORY_FILENAME = "history.jsonl"
 ANCHOR_PREFIX = "canopus-anchor:"
+
+# Tool-generated caches that live INSIDE a source tree. A recursive freeze that
+# captured these would bind the lock to artifacts no version control tracks: the
+# build loop rewrites them on its own, and any fresh checkout or cache clean
+# removes them, so the composition digest would report LOSS OF LOCK for a change
+# nobody made. Measured at the first real use of the tool on itself, 2026-07-25.
+#
+# A named set rather than "ask the VCS what it ignores": this module is imported
+# by the PreToolUse dispatcher on every write and stays stdlib-only, never
+# calling subprocess. The boundary is deliberate and stated rather than implied.
+# An ignored artifact outside this set still freezes, and discovering one is a
+# reason to widen the set, never a reason to route around the lock.
+CACHE_DIRNAMES = frozenset({
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+})
+CACHE_SUFFIXES = frozenset({".pyc", ".pyo"})
+
+# Which basenames a directory guard watches, as fnmatch patterns.
+#
+# A guard is a question, and the three questions are different. A frozen
+# directory asks "did anything at all move in here", so it watches everything.
+# An ANCESTOR of a frozen path asks the narrow question the guard was invented
+# for: did a conftest.py appear above the contract. That one file is what pytest
+# imports without being told to, and it is where a stub reaches sys.path. The
+# TREE ROOT asks a third question, because pyproject declares it on sys.path
+# (`pythonpath = ["."]`): did an importable module appear at the entry the
+# contract's own imports resolve against.
+#
+# The narrowing is not timidity, it is what makes the guard usable. Watching the
+# full composition of an ancestor put 201 of this repository's 296 test files
+# under a write deny and made the builder's next ordinary unit test report LOSS
+# OF LOCK. A guard that fires on the builder doing its job is a guard that gets
+# routed around, and a routed-around guard protects nothing.
+GUARD_NAMES_ALL = ("*",)
+GUARD_NAMES_ANCESTOR = ("conftest.py",)
+GUARD_NAMES_TREE_ROOT = ("*.py",)
+
+# Stated rather than implied, because the boundary is where the next hole lives:
+# composition lists FILES, so a PACKAGE DIRECTORY appearing at the tree root
+# (`target/__init__.py` shadowing an installed `target`) is not caught, and
+# neither is a module dropped into another in-tree sys.path entry such as
+# tests/. Both are closed by practice rather than by this primitive: the
+# contract lives in its own directory under tests/contract/, which freezes
+# RECURSIVELY, so anything appearing beside it is caught by content and by
+# composition alike. Widening the guard to cover them is a reason to change this
+# set, never a reason to route around the lock.
 
 
 class FreezeError(Exception):
@@ -77,23 +129,48 @@ def file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
-def _members(directory: Path, *, recursive: bool) -> list[Path]:
-    """Regular files in *directory*, sorted by POSIX relative path.
+def _members(
+    directory: Path, *, recursive: bool, names: Sequence[str] = GUARD_NAMES_ALL
+) -> list[Path]:
+    """Regular files in *directory* whose basename matches *names*, sorted.
 
-    Symlinks are excluded (the workspace forbids them) and anything under the
-    freeze state directory is excluded so the manifest never hashes itself.
+    Symlinks are excluded (the workspace forbids them), anything under the
+    freeze state directory is excluded so the manifest never hashes itself, and
+    tool-generated caches are excluded so the lock never binds to an artifact the
+    build regenerates (see CACHE_DIRNAMES).
+
+    *names* is a tuple of fnmatch patterns matched against the BASENAME, so a
+    recursive guard's default `("*",)` keeps every nested member while an
+    ancestor guard keeps only the one file it has a reason to watch. Matching the
+    basename rather than the relative path is what lets the same filter serve a
+    flat listing and a nested one without two spellings of every pattern.
     """
+    skipped_dirs = CACHE_DIRNAMES | {FREEZE_DIRNAME}
     candidates = directory.rglob("*") if recursive else directory.iterdir()
     files = [
         p for p in candidates
         if p.is_file()
         and not p.is_symlink()
-        and FREEZE_DIRNAME not in p.relative_to(directory).parts
+        and skipped_dirs.isdisjoint(p.relative_to(directory).parts)
+        and p.suffix not in CACHE_SUFFIXES
+        and matches_guard(p.name, names)
     ]
     return sorted(files, key=lambda p: p.relative_to(directory).as_posix())
 
 
-def dir_members_digest(directory: Path, *, recursive: bool) -> str:
+def matches_guard(name: str, names: Sequence[str]) -> bool:
+    """True when *name* matches any of the guard's fnmatch patterns.
+
+    One predicate shared by the measurement path (_members) and the write-deny
+    path (frozen_reason). Two hand-rolled copies is how the hook ends up denying
+    a file verify no longer watches, or watching one it never denies.
+    """
+    return any(fnmatch.fnmatch(name, pattern) for pattern in names)
+
+
+def dir_members_digest(
+    directory: Path, *, recursive: bool, names: Sequence[str] = GUARD_NAMES_ALL
+) -> str:
     """sha256 over the sorted POSIX relative paths of a directory's members.
 
     Composition only, not content: this is what detects a file appearing beside
@@ -101,12 +178,14 @@ def dir_members_digest(directory: Path, *, recursive: bool) -> str:
     """
     lines = "".join(
         f"{p.relative_to(directory).as_posix()}\n"
-        for p in _members(directory, recursive=recursive)
+        for p in _members(directory, recursive=recursive, names=names)
     )
     return hashlib.sha256(lines.encode("utf-8")).hexdigest()
 
 
-def dir_member_rels(directory: Path, root: Path, *, recursive: bool) -> list[str]:
+def dir_member_rels(
+    directory: Path, root: Path, *, recursive: bool, names: Sequence[str] = GUARD_NAMES_ALL
+) -> list[str]:
     """The directory's members as sorted root-relative POSIX paths.
 
     Recorded in the manifest beside the composition digest. A digest proves
@@ -118,17 +197,24 @@ def dir_member_rels(directory: Path, root: Path, *, recursive: bool) -> list[str
     """
     return sorted(
         p.relative_to(root).as_posix()
-        for p in _members(directory, recursive=recursive)
+        for p in _members(directory, recursive=recursive, names=names)
     )
 
 
 def root_hash(manifest: dict) -> str:
-    """sha256 over recipe, anchor path, sorted files, sorted dirs."""
+    """sha256 over recipe, anchor path, sorted files, sorted dirs, sorted baseline.
+
+    The baseline is in here deliberately. Outside the hash it could be edited
+    down to 1 with no indicator moving, and a per-file expected item count that
+    can be silently lowered is worse than none: it reports rigour it is not
+    delivering.
+    """
     payload = {
         "recipe": manifest["recipe"],
         "anchor": manifest.get("anchor") or "",
         "files": dict(sorted(manifest["files"].items())),
         "dirs": dict(sorted(manifest["dirs"].items())),
+        "baseline": dict(sorted((manifest.get("baseline") or {}).items())),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -209,6 +295,53 @@ def _conftest_chain(target: Path, root: Path) -> list[Path]:
     return found
 
 
+def _guard_ancestors(target: Path, root: Path, dirs: dict) -> None:
+    """Install a filtered composition guard on every ancestor of *target*.
+
+    Measured at the wire 2 intent audit, and this is the hole it closes. A
+    directory freeze guarded only the target directory, so a `conftest.py`
+    created in an ANCESTOR was invisible: verify held with nothing changed,
+    added or removed. That conftest can put a stub module on `sys.path`, and
+    because the mandated authoring rule resolves the code under test INSIDE the
+    test body at RUN time, the frozen contract goes from red to green with every
+    frozen byte intact. The item count is unchanged, so the baseline matches and
+    the run attests: LOCK HELD and ATTESTED over a hijacked contract.
+
+    Composition ONLY, never content. The guard answers "did an importable file
+    appear above the contract", not "did anything under tests/ change" --
+    freezing an ancestor's contents would stop a builder editing its own unit
+    tests, and a primitive that forbids that gets routed around in its first
+    week.
+
+    The walk INCLUDES the tree root, under a different filter. The first version
+    of this guard stopped below the root, reasoning that guarding the root's
+    composition would deny every new top-level file. The reasoning was sound and
+    the conclusion was wrong: pyproject declares `pythonpath = ["."]`, so the
+    root is the first sys.path entry the contract's own imports resolve against,
+    and stopping there left a plain `target.py` at the root able to flip the
+    contract green while verify printed LOCK HELD. Watching `*.py` there answers
+    the objection instead of surrendering to it: a note or a lockfile written
+    during the slice is not importable and does not move the guard.
+
+    An ancestor that already carries a recursive guard keeps it.
+    """
+    for ancestor in target.parents:
+        if not ancestor.is_relative_to(root):
+            break  # defensive: never walk above the tree being protected
+        at_root = ancestor == root
+        rel = "" if at_root else ancestor.relative_to(root).as_posix()
+        names = GUARD_NAMES_TREE_ROOT if at_root else GUARD_NAMES_ANCESTOR
+        if rel not in dirs:
+            dirs[rel] = {
+                "mode": "members",
+                "names": list(names),
+                "hash": dir_members_digest(ancestor, recursive=False, names=names),
+                "members": dir_member_rels(ancestor, root, recursive=False, names=names),
+            }
+        if at_root:
+            break
+
+
 def build_manifest(
     paths: Iterable[Path],
     root: Path,
@@ -216,6 +349,8 @@ def build_manifest(
     label: str,
     frozen_at: str,
     anchor: Optional[Path] = None,
+    content_only: Iterable[Path] = (),
+    baseline: Optional[dict] = None,
 ) -> dict:
     """Build a freeze manifest over *paths*, all relative to *root*.
 
@@ -227,6 +362,14 @@ def build_manifest(
     beside a frozen test. The guard is skipped when the parent is the working
     tree root, because guarding the root's composition would deny every new
     top-level file and make the tool something people route around.
+
+    A `content_only` path freezes its BYTES and installs no composition guard on
+    its parent. This is how the enforcer files are frozen. Freezing
+    scripts/run-tests.py as an ordinary file would guard scripts/, and a build
+    that cannot create a file under scripts/ cannot build anything, so the
+    required practice would be unenforceable. A new file appearing beside
+    run-tests.py does not change what run-tests.py does; an edit to its bytes
+    does. The composition guard answers a question the enforcers do not ask.
 
     Every `conftest.py` on the path from each frozen path up to the tree root is
     added by CONTENT. A composition guard records member paths only, so a
@@ -248,6 +391,7 @@ def build_manifest(
         if target.is_dir():
             dirs[rel] = {
                 "mode": "recursive",
+                "names": list(GUARD_NAMES_ALL),
                 "hash": dir_members_digest(target, recursive=True),
                 "members": dir_member_rels(target, resolved_root, recursive=True),
             }
@@ -255,15 +399,23 @@ def build_manifest(
                 files[member.relative_to(resolved_root).as_posix()] = file_digest(member)
         else:
             files[rel] = file_digest(target)
-            parent = target.parent
-            if parent != resolved_root:
-                parent_rel = parent.relative_to(resolved_root).as_posix()
-                if parent_rel not in dirs:
-                    dirs[parent_rel] = {
-                        "mode": "members",
-                        "hash": dir_members_digest(parent, recursive=False),
-                        "members": dir_member_rels(parent, resolved_root, recursive=False),
-                    }
+        _guard_ancestors(target, resolved_root, dirs)
+        for conftest in _conftest_chain(target, resolved_root):
+            files.setdefault(
+                conftest.relative_to(resolved_root).as_posix(), file_digest(conftest)
+            )
+
+    # Positional paths are processed first, deliberately: a path given BOTH ways
+    # keeps the parent guard its positional form installed, and the digest
+    # written twice is the same value.
+    for raw in content_only:
+        target = validate_freeze_path(Path(raw), resolved_root)
+        if target.is_dir():
+            raise FreezeError(
+                f"{target} is a directory; --content freezes file bytes only. "
+                f"Pass it positionally to freeze it recursively."
+            )
+        files[target.relative_to(resolved_root).as_posix()] = file_digest(target)
         for conftest in _conftest_chain(target, resolved_root):
             files.setdefault(
                 conftest.relative_to(resolved_root).as_posix(), file_digest(conftest)
@@ -275,6 +427,7 @@ def build_manifest(
         "frozen_at": frozen_at,
         "anchor": str(validate_anchor_path(anchor, resolved_root)) if anchor else "",
         "git_sha": "",
+        "baseline": dict(sorted((baseline or {}).items())),
         "files": dict(sorted(files.items())),
         "dirs": dict(sorted(dirs.items())),
     }
@@ -307,12 +460,21 @@ def recompute(manifest: dict, root: Path) -> dict:
     for rel, entry in manifest["dirs"].items():
         candidate = resolved_root / rel
         recursive = entry["mode"] == "recursive"
+        # Read from the manifest, never re-derived from the path. Re-deriving
+        # would let a re-measurement widen or narrow a guard the approval was
+        # taken over, which is the one thing recompute must not be able to do.
+        names = entry["names"]
         alive = candidate.is_dir()
         dirs[rel] = {
             "mode": entry["mode"],
-            "hash": dir_members_digest(candidate, recursive=recursive) if alive else "",
+            "names": list(names),
+            "hash": (
+                dir_members_digest(candidate, recursive=recursive, names=names)
+                if alive else ""
+            ),
             "members": (
-                dir_member_rels(candidate, resolved_root, recursive=recursive) if alive else []
+                dir_member_rels(candidate, resolved_root, recursive=recursive, names=names)
+                if alive else []
             ),
         }
     return {
@@ -320,6 +482,9 @@ def recompute(manifest: dict, root: Path) -> dict:
         "anchor": manifest.get("anchor") or "",
         "files": dict(sorted(files.items())),
         "dirs": dict(sorted(dirs.items())),
+        # Carried through verbatim: the baseline is a recorded expectation, not
+        # something disk can be re-measured for.
+        "baseline": dict(sorted((manifest.get("baseline") or {}).items())),
     }
 
 
@@ -394,13 +559,18 @@ def read_anchor(anchor_path: Path) -> Tuple[str, Optional[str]]:
     except OSError:
         # Unreadable is not "absent": treat it like a vanished anchor.
         return (ANCHOR_MISSING, None)
+    found: Optional[str] = None
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith(ANCHOR_PREFIX):
             value = stripped[len(ANCHOR_PREFIX):].strip().lower()
             if value:
-                return (ANCHOR_RECORDED, value)
-    return (ANCHOR_UNRECORDED, None)
+                # LAST wins. A replaced anchor appends rather than overwriting,
+                # so the artifact keeps the whole approval trail; pinning to the
+                # first line would make every legitimate re-freeze read as a
+                # disagreement forever.
+                found = value
+    return (ANCHOR_RECORDED, found) if found else (ANCHOR_UNRECORDED, None)
 
 
 def anchor_state(
@@ -452,12 +622,15 @@ def frozen_reason(rel_posix: str, manifest: dict) -> Optional[str]:
     """
     if rel_posix in manifest["files"]:
         return f"{rel_posix} is a frozen contract file"
-    parent = rel_posix.rsplit("/", 1)[0] if "/" in rel_posix else ""
+    parent, _, name = rel_posix.rpartition("/")
     for dir_rel, entry in manifest["dirs"].items():
         if entry["mode"] == "recursive":
             if rel_posix == dir_rel or rel_posix.startswith(dir_rel + "/"):
                 return f"{rel_posix} is inside the frozen directory {dir_rel}/"
-        elif parent == dir_rel:
+        elif parent == dir_rel and matches_guard(name, entry["names"]):
+            # The same filter verify measures with. A deny wider than the
+            # measurement refuses writes nothing would have reported, which is
+            # how a discipline tool becomes an obstacle.
             return f"{rel_posix} would join the guarded composition of {dir_rel}/"
     return None
 
@@ -520,7 +693,7 @@ def _validate_manifest_shape(manifest: dict, path: Path) -> None:
     exactly those two and denies fail-closed; anything else falls through its
     outer catch-all, logs an advisory, and continues -- fail OPEN).
     """
-    for key in (*_STR_SCALAR_KEYS, "files", "dirs"):
+    for key in (*_STR_SCALAR_KEYS, "files", "dirs", "baseline"):
         _require(key in manifest, f"freeze manifest at {path} is missing {key!r}")
 
     for key in _STR_SCALAR_KEYS:
@@ -564,7 +737,9 @@ def _validate_manifest_shape(manifest: dict, path: Path) -> None:
         # A dir entry without its recorded member list would make every existing
         # member read as newly added. Refuse it rather than report a false alarm.
         _require(
-            isinstance(entry, dict) and "mode" in entry and "hash" in entry and "members" in entry,
+            isinstance(entry, dict)
+            and "mode" in entry and "hash" in entry
+            and "members" in entry and "names" in entry,
             f"freeze manifest at {path} has an incomplete entry for directory {rel!r}",
         )
         mode = entry["mode"]
@@ -584,6 +759,24 @@ def _validate_manifest_shape(manifest: dict, path: Path) -> None:
             f"freeze manifest at {path} has a non-string 'hash' for directory "
             f"{rel!r} ({type(entry['hash']).__name__}), expected a string",
         )
+        # An empty or non-list 'names' would make matches_guard() answer False
+        # for every basename, silently reducing the guard to nothing while the
+        # manifest still reports a guarded directory. Refused, like an
+        # unrecognised mode, because a guard that watches nothing and says it
+        # watches something is worse than no guard at all.
+        names = entry["names"]
+        _require(
+            isinstance(names, list) and names,
+            f"freeze manifest at {path} has an empty or non-list 'names' for "
+            f"directory {rel!r}, expected a non-empty list of patterns",
+        )
+        for pattern in names:
+            _require(
+                isinstance(pattern, str),
+                f"freeze manifest at {path} has a non-string pattern in 'names' "
+                f"for directory {rel!r} ({type(pattern).__name__}), expected a string",
+            )
+
         members = entry["members"]
         _require(
             isinstance(members, list),
@@ -596,6 +789,26 @@ def _validate_manifest_shape(manifest: dict, path: Path) -> None:
                 f"freeze manifest at {path} has a non-string member in 'members' "
                 f"for directory {rel!r} ({type(member).__name__}), expected a string",
             )
+
+    baseline = manifest["baseline"]
+    _require(
+        isinstance(baseline, dict),
+        f"freeze manifest at {path} has a non-dict 'baseline' value "
+        f"({type(baseline).__name__}), expected a dict",
+    )
+    for rel, count in baseline.items():
+        _require(
+            isinstance(rel, str),
+            f"freeze manifest at {path} has a non-string key in 'baseline' "
+            f"({type(rel).__name__}), expected a string",
+        )
+        # bool is a subclass of int; a JSON `true` here would silently compare
+        # equal to a collected count of 1.
+        _require(
+            isinstance(count, int) and not isinstance(count, bool),
+            f"freeze manifest at {path} has a non-integer 'baseline' value for "
+            f"{rel!r} ({type(count).__name__}), expected an integer",
+        )
 
 
 def read_freeze(root: Path) -> Optional[dict]:
@@ -696,6 +909,11 @@ def append_history(
 # to run it: pytest -k, --deselect, --ignore, --lf and a bare path argument all
 # reach green with every frozen byte intact.
 #
+# From wire 2 a bare path or a node id is ALSO caught, for any file carrying a
+# freeze-time baseline: the record compares what was collected against how many
+# items that file yields when collected whole, so a subset reports 1 of 7. A
+# frozen test file with no baseline entry keeps the wire 1 comparison.
+#
 # This records, it does not block, and nothing here is fatal. Failing a filtered
 # run would charge every inner-loop iteration for a hole that a passive record
 # closes at the point of comparison, and a primitive that forbids `pytest -k`
@@ -752,6 +970,7 @@ def build_attestation(
     frozen_tests: dict,
     exit_status: int,
     attested_at: str,
+    baseline: Optional[dict] = None,
 ) -> dict:
     """Assemble the record written at session finish. Pure: no disk, no pytest.
 
@@ -775,30 +994,29 @@ def build_attestation(
     same rule already governs verify, which refuses to print a green line when
     there is no contract to check.
 
-    WHAT IT DOES NOT CATCH, stated so the gap is a known property rather than a
-    discovered one. A run that names a SUBSET by node id -- `pytest
-    tests/test_x.py::test_one` on a three-test frozen file -- collects one item,
-    reports one item, fires no deselection hook, and attests. Measured, and it
-    is the residual hole in "did the contract run": the record compares reported
-    against collected, and nothing anywhere knows how many items the file yields
-    when collected whole. Filters (-k, -m, --lf, --deselect) ARE caught, because
-    they leave a deselection count behind; --ignore and a vanished file are
-    caught, because they collect nothing. Closing the node-id case needs a
-    full-collection baseline taken at freeze time, which is a larger change than
-    the one this record makes, so read ATTESTED as "the frozen tests that were
-    collected all passed", not as "every frozen test ran".
+    The node-id subset case IS caught, from wire 2 onward. A contract frozen with
+    --contract carries a per-file item count taken at freeze time, so `pytest
+    tests/contract/s/test_a.py::test_one` reports 1 against 7 and does not
+    attest. A frozen test file with no baseline entry keeps the wire 1
+    behaviour, where collected is compared only against what was reported.
     """
     reasons: list[str] = []
     if not frozen_tests:
         reasons.append("the freeze contains no test files to attest")
+    expected_counts = baseline or {}
     for rel, counts in sorted(frozen_tests.items()):
         collected = counts.get("collected", 0)
         reported = counts.get("passed", 0) + counts.get("skipped", 0)
+        expected = expected_counts.get(rel)
         if not collected:
             reasons.append(f"frozen test file collected nothing: {rel}")
         elif counts.get("deselected", 0):
             reasons.append(
                 f"frozen test file had {counts['deselected']} items deselected: {rel}"
+            )
+        elif expected is not None and collected != expected:
+            reasons.append(
+                f"frozen test file collected {collected} of {expected}: {rel}"
             )
         if counts.get("failed", 0):
             reasons.append(f"frozen test file reported failures: {rel}")
