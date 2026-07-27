@@ -26,16 +26,18 @@ this catches is tampering by helpfulness: the model hits a red assertion,
 concludes in good faith that the assertion is wrong, and edits it. A verification
 that merely runs catches that completely.
 
-Recipe `canopus-freeze-v4`, named in every manifest so a future algorithm change
+Recipe `canopus-freeze-v5`, named in every manifest so a future algorithm change
 breaks loudly instead of silently:
 
     file digest = sha256(LF-normalized bytes)
     dir digest  = sha256("".join(f"{relpath}\\n" for relpath in sorted members))
     root hash   = sha256(canonical JSON of
-                         {recipe, anchor, anchor_repo, files, dirs, baseline})
+                         {recipe, anchor, anchor_repo, files, dirs, baseline,
+                          plugins})
 
 where a directory's members are those whose BASENAME matches one of the entry's
-recorded `names` patterns.
+recorded `names` patterns, and a member that is itself a directory is rendered
+with a trailing `/` so a file and a directory of the same name are two lines.
 
 Per-file bytes are LF-normalized (\\r\\n -> \\n) so a CRLF working copy and a
 fresh LF checkout agree, matching the recipe already proven in
@@ -62,7 +64,12 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 from scripts.utils.atomic import atomic_write_text
 
-RECIPE = "canopus-freeze-v4"
+# v5 from wire 2.3: the plugin baseline joined the root-hash payload. The bump is
+# what turns a v4 manifest into a NAMED refusal at `read_freeze` ("carries recipe
+# canopus-freeze-v4") instead of a silent LOSS OF LOCK on a tree where nothing
+# moved, which is what a new hash field without a bump produces. Same reasoning
+# as v2, which added the per-file baseline.
+RECIPE = "canopus-freeze-v5"
 FREEZE_DIRNAME = ".canopus"
 FREEZE_FILENAME = "freeze.json"
 HISTORY_FILENAME = "history.jsonl"
@@ -114,6 +121,13 @@ CACHE_DIRNAMES = frozenset({
 })
 CACHE_SUFFIXES = frozenset({".pyc", ".pyo"})
 
+# The directory names no guard ever measures, as ONE constant rather than a
+# local rebuilt per call. `_members` filters with it and `watched_directory`
+# answers with it, and those two are the measure and the deny: a set spelled
+# twice is how the deny refuses a path the measurement ignores, or excuses one
+# it watches.
+SKIPPED_DIRNAMES = CACHE_DIRNAMES | {FREEZE_DIRNAME}
+
 # Which basenames a directory guard watches, as fnmatch patterns.
 #
 # A guard is a question, and the three questions are different. A frozen
@@ -134,15 +148,67 @@ GUARD_NAMES_ALL = ("*",)
 GUARD_NAMES_ANCESTOR = ("conftest.py",)
 GUARD_NAMES_TREE_ROOT = ("*.py",)
 
-# Stated rather than implied, because the boundary is where the next hole lives:
-# composition lists FILES, so a PACKAGE DIRECTORY appearing at the tree root
-# (`target/__init__.py` shadowing an installed `target`) is not caught, and
-# neither is a module dropped into another in-tree sys.path entry such as
-# tests/. Both are closed by practice rather than by this primitive: the
-# contract lives in its own directory under tests/contract/, which freezes
-# RECURSIVELY, so anything appearing beside it is caught by content and by
-# composition alike. Widening the guard to cover them is a reason to change this
-# set, never a reason to route around the lock.
+# Stated rather than implied, because the boundary is where the next hole lives.
+#
+# CLOSED in wire 2.3: the tree-root guard's composition now lists importable
+# SUBDIRECTORIES beside `*.py` files, each rendered with a trailing `/`, so a
+# package directory dropped at the root (`plug/__init__.py` shadowing an
+# installed `plug`) moves the guard. `_members` carries the rule; `member_rel`
+# carries the mark.
+#
+# PYTEST ADDS NO SECOND IN-TREE sys.path ENTRY, and that is measured, not
+# assumed. pyproject sets `addopts = "--strict-markers --import-mode=importlib"`,
+# and under importlib pytest inserts NOTHING for a collected test file: on a
+# scratch tree carrying that setting, `sys.path[:2]` at run time inside
+# `tests/contract/<slice>/test_contract.py` was the tree root twice (the
+# `pythonpath = ["."]` entry and the rootdir) and nothing else. A package at
+# `tests/plug/` and a package beside the contract were both `ImportError: No
+# module named …`; only the root-level package imported. So the root guard is
+# the whole surface pytest contributes, and there is no second entry to widen to.
+#
+# Said exactly that wide. It is NOT the claim that nothing importable lives
+# under the tree: `.venv/…/site-packages` does, which is the reason
+# `canopus_gate._library_dirs` exists to tell an interpreter library from an
+# in-tree file. What is measured is that pytest adds no tree-owned entry beyond
+# the one `pythonpath = ["."]` already declares.
+#
+# An earlier revision of this note derived the same conclusion from pytest's
+# PREPEND mode inserting a test file's basedir, and stated a trigger ("it
+# becomes live if the slice directory gains an `__init__.py`") that can never
+# fire. That measurement had been taken on a scratch tree missing this
+# repository's own addopts. It is corrected here rather than quietly dropped,
+# because a false reason left standing is what the next slice reasons from.
+#
+# Two cases stay open, and neither is closed by this primitive:
+#
+#   * A change to the IMPORT MODE re-opens the surface. `--import-mode=prepend`
+#     (the pytest default) inserts each collected test file's basedir, which
+#     puts `tests/contract/<slice>/` on sys.path — measured on the same scratch
+#     tree with the flag removed. That switch is one line in `pyproject.toml`,
+#     which is neither frozen by content nor watched by this guard, since the
+#     root guard watches `*.py` and importable directories. What holds the case
+#     today is that the contract lives in its own directory under
+#     tests/contract/, which freezes RECURSIVELY, so a package appearing beside
+#     it moves the composition anyway (measured: `plug/__init__.py` there
+#     reports added; an EMPTY `plug/` there does not, the recursive arm lists
+#     files).
+#   * A directory the BUILD generates at the root. The three present on this
+#     machine are `dist/` (written by scripts/dev/build-plugins.py), `outputs/`
+#     and `plans/`, but the real surface is the ignore list, not today's disk:
+#     `.gitignore` carries 18 identifier-shaped root-level entries, 17 of them
+#     outside CACHE_DIRNAMES — `htmlcov` (which a single `--cov-report=html`
+#     run writes at the root), `threads`, `crm`, `knowledge`, `context`,
+#     `datastore`, `corporate`, `personal`, `_archive`, `slash`, `_secure`,
+#     `Desktop`, `LauncherFolder`, `MyDocuments` and the three above. Every one
+#     is importable, so every one is watched on purpose, and the cost is that a
+#     `git clean -xfd`, a first `build-plugins.py` run, or one HTML coverage
+#     report moves the root composition with no source edited. Accepted rather
+#     than excluded, because an exclusion set wide enough to cover seventeen
+#     names is exactly where a real shadowing directory would hide, and the
+#     failure is loud and instantly explicable rather than silent.
+#
+# Widening the guard further is a reason to change this set, never a reason to
+# route around the lock.
 
 
 class FreezeError(Exception):
@@ -158,10 +224,105 @@ def file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
+def dir_member_name(rel_posix: str) -> str:
+    """The composition's spelling of a DIRECTORY member: its name plus `/`.
+
+    One function, because the mark is an invariant and not a formatting choice.
+    The composition is a digest over rendered names, so without the trailing
+    slash a directory `plug` and a file `plug` produce the same line and one
+    replacing the other moves nothing. The measurement (`member_rel`) spells it
+    here, and any future reader of the composition should too.
+    """
+    return f"{rel_posix}/"
+
+
+def member_rel(path: Path, base: Path, *, is_dir: bool) -> str:
+    """A member's *base*-relative POSIX name, marked when it is a directory.
+
+    ONE renderer, shared by `dir_members_digest`, `dir_member_rels` and the sort
+    order all three agree on, for the reason `matches_guard` is shared by the
+    measure and the deny: two hand-rolled copies is how the digest and the
+    member list end up disagreeing about the same directory.
+
+    *is_dir* is REQUIRED and carried in from `_members`, never re-derived with a
+    second `is_dir()` call. This module argues that `recompute` must carry the
+    manifest's fields through rather than re-measure them; the same discipline
+    applies four lines down. Re-statting also gave a wrong answer for a real
+    interleaving: a directory removed between the classification and the
+    rendering came out unmarked, so the digest and the member list disagreed
+    about the same entry. The mark cannot come from the Path itself, which is
+    why it is a parameter: `Path("plug/") == Path("plug")`.
+    """
+    rel = path.relative_to(base).as_posix()
+    return dir_member_name(rel) if is_dir else rel
+
+
+def guard_watches_directories(names: Sequence[str]) -> bool:
+    """Does this guard's pattern set watch subdirectories at all?
+
+    The discriminator `watched_directory` keys on, split out so `cmd_status` can
+    print a guard's real scope without a second copy of it. `status` printed
+    `watching *.py` for the tree root and said nothing about the importable
+    directories the same guard measures, which UNDER-states the scope: the
+    inverse of the misreading that filter was added to prevent.
+
+    Spelled `tuple(names) == ...` for the reason argued in `watched_directory`:
+    the build path passes the TUPLE and the recompute path passes the LIST that
+    JSON round-tripped it into.
+    """
+    return tuple(names) == GUARD_NAMES_TREE_ROOT
+
+
+def watched_directory(name: str, names: Sequence[str]) -> bool:
+    """Would a subdirectory called *name* join a shallow guard's composition?
+
+    The rule the tree-root guard measures with, as one predicate. `_members`
+    calls it to list the directories that are already there, and `cmd_status`
+    reaches it through `guard_watches_directories` to print the real scope. The
+    write-deny does NOT call it: refusing the write that CREATES such a
+    directory was tried in wire 2.3 and withdrawn, for the reason `frozen_reason`
+    records. So this predicate now serves DETECTION only, and the gap between
+    what is watched and what is prevented is on the open list rather than closed.
+
+    The pattern-set test is spelled `tuple(names) == ...` deliberately.
+    `_guard_ancestors` passes the TUPLE GUARD_NAMES_TREE_ROOT and `recompute`
+    passes the LIST the manifest round-tripped through JSON. Written with `is`,
+    or with a bare `==` against the tuple, it is true on the build path and
+    false on the recompute path: directories enter the stored digest and never
+    the recomputed one, and the tree reports LOSS OF LOCK forever with nothing
+    moved. That is wire 2.2's blocker B1 verbatim.
+
+    `str.isidentifier()` is most of the rest, and deliberately not a denylist of
+    bad names: `.git`, `.venv` and `.canopus` fall out because a leading dot is
+    not an identifier. A directory named for a Python keyword (`class`,
+    `import`) passes and is watched, which is the safe direction, and so does a
+    non-ASCII identifier like `café`. What `isidentifier()` does NOT do is
+    separate an authored directory from a generated one — `__pycache__` passes
+    it — which is why SKIPPED_DIRNAMES is consulted here too.
+    """
+    return (
+        guard_watches_directories(names)
+        and name.isidentifier()
+        and name not in SKIPPED_DIRNAMES
+    )
+
+
 def _members(
     directory: Path, *, recursive: bool, names: Sequence[str] = GUARD_NAMES_ALL
-) -> list[Path]:
-    """Regular files in *directory* whose basename matches *names*, sorted.
+) -> list[tuple[Path, bool]]:
+    """Members of *directory* matching *names*, sorted, each with its kind.
+
+    Returns `(path, is_dir)` pairs rather than bare paths: the classification is
+    made once here, where the entry is already being examined, and carried to
+    the renderer. Every caller is in this module.
+
+    Regular files always, plus — under a shallow walk with the tree-root
+    patterns — subdirectories `watched_directory` accepts, because
+    `pythonpath = ["."]` makes such a directory an importable package at the
+    entry the contract's own imports resolve against. The `not recursive` half
+    is a guard, not decoration: the discriminator keys on the PATTERN SET, so
+    without it a recursive walk asked for the root patterns would pull every
+    nested directory into the composition.
 
     Symlinks are excluded (the workspace forbids them), anything under the
     freeze state directory is excluded so the manifest never hashes itself, and
@@ -174,17 +335,24 @@ def _members(
     basename rather than the relative path is what lets the same filter serve a
     flat listing and a nested one without two spellings of every pattern.
     """
-    skipped_dirs = CACHE_DIRNAMES | {FREEZE_DIRNAME}
+    watch_dirs = not recursive
     candidates = directory.rglob("*") if recursive else directory.iterdir()
-    files = [
-        p for p in candidates
-        if p.is_file()
-        and not p.is_symlink()
-        and skipped_dirs.isdisjoint(p.relative_to(directory).parts)
-        and p.suffix not in CACHE_SUFFIXES
-        and matches_guard(p.name, names)
-    ]
-    return sorted(files, key=lambda p: p.relative_to(directory).as_posix())
+    found: list[tuple[Path, bool]] = []
+    for p in candidates:
+        if p.is_symlink():
+            continue
+        if not SKIPPED_DIRNAMES.isdisjoint(p.relative_to(directory).parts):
+            continue
+        if p.is_dir():
+            if watch_dirs and watched_directory(p.name, names):
+                found.append((p, True))
+        elif (
+            p.is_file()
+            and p.suffix not in CACHE_SUFFIXES
+            and matches_guard(p.name, names)
+        ):
+            found.append((p, False))
+    return sorted(found, key=lambda pair: member_rel(pair[0], directory, is_dir=pair[1]))
 
 
 def matches_guard(name: str, names: Sequence[str]) -> bool:
@@ -206,8 +374,8 @@ def dir_members_digest(
     a frozen one (the conftest.py case), while per-file digests detect edits.
     """
     lines = "".join(
-        f"{p.relative_to(directory).as_posix()}\n"
-        for p in _members(directory, recursive=recursive, names=names)
+        f"{member_rel(p, directory, is_dir=is_dir)}\n"
+        for p, is_dir in _members(directory, recursive=recursive, names=names)
     )
     return hashlib.sha256(lines.encode("utf-8")).hexdigest()
 
@@ -225,8 +393,8 @@ def dir_member_rels(
     added and the guard cries wolf on its first use.
     """
     return sorted(
-        p.relative_to(root).as_posix()
-        for p in _members(directory, recursive=recursive, names=names)
+        member_rel(p, root, is_dir=is_dir)
+        for p, is_dir in _members(directory, recursive=recursive, names=names)
     )
 
 
@@ -269,8 +437,27 @@ def anchor_binding(manifest: dict) -> dict:
     return dict(binding)
 
 
+def manifest_plugins(manifest: dict) -> list:
+    """The plugin set a freeze captured, as a sorted list of NAMES.
+
+    Names only, and never the origins they were read from. An origin is an
+    absolute path inside `.venv`: it differs per machine and per clone, so
+    comparing it would redden every fresh checkout, and it would put an
+    operator's home directory inside a hash this repository commits against —
+    the engine repository is public. The names are the identities
+    `canopus_gate.process_facts` derives, which already carry their provenance
+    (`dist:`, `intree:`), so nothing a comparison can use is lost.
+
+    Accepts a mapping (whose keys are the names) or any iterable of names, so a
+    caller holding the recorder's `{identity: origin}` map and a caller holding
+    the captured list both write the same payload.
+    """
+    plugins = manifest.get("plugins") or ()
+    return sorted({str(name) for name in plugins})
+
+
 def root_hash(manifest: dict) -> str:
-    """sha256 over recipe, anchor path, anchor_repo binding, sorted files, dirs, baseline.
+    """sha256 over recipe, anchor, anchor_repo, files, dirs, baseline, plugins.
 
     The baseline is in here deliberately. Outside the hash it could be edited
     down to 1 with no indicator moving, and a per-file expected item count that
@@ -281,6 +468,11 @@ def root_hash(manifest: dict) -> str:
     a builder edits `anchor_repo` to `in_repo: false`, wins the working-copy
     fallback permanently, and the committed approval still matches. Inside it,
     the edit changes the root and the approval stops matching.
+
+    The plugin baseline is in here for that same reason a third time: it is the
+    set every later attestation is compared against, so outside the hash a
+    builder appends the name of the plugin that skips the contract and no
+    indicator moves.
     """
     payload = {
         "recipe": manifest["recipe"],
@@ -289,6 +481,7 @@ def root_hash(manifest: dict) -> str:
         "files": dict(sorted(manifest["files"].items())),
         "dirs": dict(sorted(manifest["dirs"].items())),
         "baseline": dict(sorted((manifest.get("baseline") or {}).items())),
+        "plugins": manifest_plugins(manifest),
     }
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -414,9 +607,11 @@ def _guard_ancestors(target: Path, root: Path, dirs: dict) -> None:
     the conclusion was wrong: pyproject declares `pythonpath = ["."]`, so the
     root is the first sys.path entry the contract's own imports resolve against,
     and stopping there left a plain `target.py` at the root able to flip the
-    contract green while verify printed LOCK HELD. Watching `*.py` there answers
-    the objection instead of surrendering to it: a note or a lockfile written
-    during the slice is not importable and does not move the guard.
+    contract green while verify printed LOCK HELD. Watching what is IMPORTABLE
+    there answers the objection instead of surrendering to it: `*.py` files, and
+    subdirectories whose name is an identifier, so a package directory shadows
+    nothing quietly, while a note or a lockfile written during the slice does
+    not move the guard.
 
     An ancestor that already carries a recursive guard keeps it.
     """
@@ -447,6 +642,7 @@ def build_manifest(
     content_only: Iterable[Path] = (),
     baseline: Optional[dict] = None,
     anchor_repo: Optional[dict] = None,
+    plugins: Optional[Iterable[str]] = None,
 ) -> dict:
     """Build a freeze manifest over *paths*, all relative to *root*.
 
@@ -455,9 +651,10 @@ def build_manifest(
 
     A file freezes itself and additionally installs a NON-recursive composition
     guard on its parent directory, which is what catches a conftest.py dropped
-    beside a frozen test. The guard is skipped when the parent is the working
-    tree root, because guarding the root's composition would deny every new
-    top-level file and make the tool something people route around.
+    beside a frozen test. The tree root gets a guard too, filtered down to what
+    is importable there (see `_guard_ancestors`): guarding the root's whole
+    composition would deny every new top-level file and make the tool something
+    people route around.
 
     A `content_only` path freezes its BYTES and installs no composition guard on
     its parent. This is how the enforcer files are frozen. Freezing
@@ -491,7 +688,8 @@ def build_manifest(
                 "hash": dir_members_digest(target, recursive=True),
                 "members": dir_member_rels(target, resolved_root, recursive=True),
             }
-            for member in _members(target, recursive=True):
+            # A recursive walk yields files only, so the kind is discarded here.
+            for member, _is_dir in _members(target, recursive=True):
                 files[member.relative_to(resolved_root).as_posix()] = file_digest(member)
         else:
             files[rel] = file_digest(target)
@@ -525,6 +723,12 @@ def build_manifest(
         "anchor_repo": dict(anchor_repo or ANCHOR_REPO_UNBOUND),
         "git_sha": "",
         "baseline": dict(sorted((baseline or {}).items())),
+        # The plugin set the contract run loaded, captured rather than derived:
+        # `recompute` cannot re-run pytest, and a field inside the hash that the
+        # recompute path cannot reproduce is a permanent LOSS OF LOCK on an
+        # untouched tree. That is wire 2.2's blocker B1 verbatim, and the
+        # per-file baseline beside it is carried for the same reason.
+        "plugins": manifest_plugins({"plugins": plugins}),
         "files": dict(sorted(files.items())),
         "dirs": dict(sorted(dirs.items())),
     }
@@ -580,12 +784,14 @@ def recompute(manifest: dict, root: Path) -> dict:
         "anchor_repo": anchor_binding(manifest),
         "files": dict(sorted(files.items())),
         "dirs": dict(sorted(dirs.items())),
-        # Carried through verbatim, both of them: the baseline is a recorded
-        # expectation and the binding is a recorded measurement, and neither is
-        # something disk can be re-measured for. Any key root_hash reads and
-        # recompute omits makes the recomputed root differ from the stored one
-        # forever, which reads as LOSS OF LOCK over a tree where nothing moved.
+        # Carried through verbatim, all three: the baseline and the plugin set
+        # are recorded expectations, the binding is a recorded measurement, and
+        # none of them is something disk can be re-measured for. Any key
+        # root_hash reads and recompute omits makes the recomputed root differ
+        # from the stored one forever, which reads as LOSS OF LOCK over a tree
+        # where nothing moved.
         "baseline": dict(sorted((manifest.get("baseline") or {}).items())),
+        "plugins": manifest_plugins(manifest),
     }
 
 
@@ -911,6 +1117,27 @@ def frozen_reason(rel_posix: str, manifest: dict) -> Optional[str]:
 
     The dispatcher calls this on every Write/Edit, so it must stay cheap: no
     hashing, no stat calls.
+
+    Two questions, and a third that was tried and WITHDRAWN. Wire 2.3 briefly
+    also refused any Write that would CREATE a watched top-level directory, on
+    the argument that a guard watching directories should refuse the one Write
+    that installs one, since the Write tool makes missing parents. The argument
+    is sound and the deny was not: measured under a held freeze, an ordinary
+    note written under the workspace's private `threads/` tree was refused,
+    because that name is an identifier-shaped top-level directory which is
+    data-routed and absent from a fresh engine clone. `check_canopus_freeze`
+    also runs BEFORE `check_protect_personal_threads` in the dispatcher's chain,
+    so the deny took writes the workspace's own design expects to reach that
+    later check, and it did so for every frozen slice. Detection at `verify` is
+    kept and prevention is not: a guard that reddens on ordinary work is one an
+    operator learns to release around, which is worse than no guard. The
+    asymmetry is real, recorded on the open list in `docs/EXTENDING.md`, and
+    deliberate rather than overlooked.
+
+    So the deny is basename-shaped: a path is refused when it IS a frozen file,
+    when it sits inside a recursively frozen directory, or when its own basename
+    would join a guard's watched composition. A path whose FIRST component does
+    not exist yet is not this function's business.
     """
     if rel_posix in manifest["files"]:
         return f"{rel_posix} is a frozen contract file"
@@ -924,7 +1151,8 @@ def frozen_reason(rel_posix: str, manifest: dict) -> Optional[str]:
         if entry["mode"] == "recursive":
             if rel_posix == dir_rel or rel_posix.startswith(dir_rel + "/"):
                 return f"{rel_posix} is inside the frozen directory {shown}/"
-        elif parent == dir_rel and matches_guard(name, entry["names"]):
+            continue
+        if parent == dir_rel and matches_guard(name, entry["names"]):
             # The same filter verify measures with. A deny wider than the
             # measurement refuses writes nothing would have reported, which is
             # how a discipline tool becomes an obstacle.
@@ -990,7 +1218,8 @@ def _validate_manifest_shape(manifest: dict, path: Path) -> None:
     exactly those two and denies fail-closed; anything else falls through its
     outer catch-all, logs an advisory, and continues -- fail OPEN).
     """
-    for key in (*_STR_SCALAR_KEYS, "files", "dirs", "baseline", "anchor_repo"):
+    for key in (*_STR_SCALAR_KEYS, "files", "dirs", "baseline", "plugins",
+                "anchor_repo"):
         _require(key in manifest, f"freeze manifest at {path} is missing {key!r}")
 
     for key in _STR_SCALAR_KEYS:
@@ -1105,6 +1334,23 @@ def _validate_manifest_shape(manifest: dict, path: Path) -> None:
             isinstance(count, int) and not isinstance(count, bool),
             f"freeze manifest at {path} has a non-integer 'baseline' value for "
             f"{rel!r} ({type(count).__name__}), expected an integer",
+        )
+
+    # A non-list here would reach `manifest_plugins`, which iterates it: a JSON
+    # string iterates as characters, so `"xdist"` would become a five-name
+    # baseline and every attestation would refuse for five plugins nobody
+    # loaded. Refused with the key named, like every other shape above.
+    plugins = manifest["plugins"]
+    _require(
+        isinstance(plugins, list),
+        f"freeze manifest at {path} has a non-list 'plugins' value "
+        f"({type(plugins).__name__}), expected a list",
+    )
+    for name in plugins:
+        _require(
+            isinstance(name, str),
+            f"freeze manifest at {path} has a non-string entry in 'plugins' "
+            f"({type(name).__name__}), expected a string",
         )
 
     binding = manifest["anchor_repo"]
@@ -1337,7 +1583,12 @@ def unreleased_freeze(entries: Sequence[dict]) -> Optional[dict]:
 # what proved unreliable.
 
 ATTEST_FILENAME = "attest.json"
-ATTEST_RECIPE = "canopus-attest-v1"
+# v2 from wire 2.3: the record now carries a `process` block and is refused when
+# the plugin set differs from the one the freeze captured. A v1 record reads NOT
+# ATTESTED through the recipe check in `attestation_state` below, which is the
+# fail-closed direction and needs no migration: a record written before the
+# comparison existed cannot testify about a comparison it never made.
+ATTEST_RECIPE = "canopus-attest-v2"
 ATTESTED = "ATTESTED"
 NOT_ATTESTED = "NOT ATTESTED"
 
@@ -1385,6 +1636,8 @@ def build_attestation(
     exit_status: int,
     attested_at: str,
     baseline: Optional[dict] = None,
+    process: Optional[dict] = None,
+    plugin_baseline: Optional[Iterable[str]] = None,
 ) -> dict:
     """Assemble the record written at session finish. Pure: no disk, no pytest.
 
@@ -1413,6 +1666,41 @@ def build_attestation(
     tests/contract/s/test_a.py::test_one` reports 1 against 7 and does not
     attest. A frozen test file with no baseline entry keeps the wire 1
     behaviour, where collected is compared only against what was reported.
+
+    `process` describes what CONFIGURED the interpreter this record speaks for:
+    the registered plugins, the parsed `-p` option, the PYTEST_ names in the
+    environment, the launcher, and each xdist worker's plugin list. None when
+    nothing described the process, which is every caller written before the
+    field existed, and which reads as damage rather than as innocence. A single
+    WORKER entry that is not a list of names says the same thing about one
+    worker, and is read the same way.
+
+    `plugin_baseline` is the plugin set the freeze captured. The comparison
+    against it is ONE refusal, not a list of blocked routes: an entry-point
+    plugin, a `-p` on argv, a `-p` inside PYTEST_ADDOPTS and a `-p` inside an
+    ini `addopts` all leave a name the freeze never saw. That is why `-p` is
+    never banned here: banning it forbade PYTEST_DISABLE_PLUGIN_AUTOLOAD plus an
+    explicit `-p` per allowed plugin, the only measured cure for the entry-point
+    route, so the first design banned its own cure.
+
+    Said no wider than it is true, because this repository has already had to
+    retract one claim of this shape. The comparison covers every plugin from a
+    DISTRIBUTION and every in-tree plugin pytest did not register by COLLECTION,
+    whatever route loaded it. A COLLECTED conftest outside the frozen contract
+    directory is recorded as provenance and not compared, because which conftests
+    collection loads depends on what was collected. Closing that one needs a different instrument, and it
+    is on the open list rather than covered by this sentence.
+
+    Both directions are refused. A plugin that VANISHED changed what the run
+    measured just as surely as one that appeared, and a comparison that only
+    looked for additions would call that honest.
+
+    The names compared are the identities `process_facts` derives, never pytest
+    registration names, and the set it hands over is every `dist:` identity plus
+    every `intree:` identity pytest did not register as a collected conftest.
+    Both are wire 2.3 measurements rather than taste, and both are argued where
+    they are computed (`canopus_gate._plugin_identity`,
+    `canopus_gate.process_facts`).
     """
     reasons: list[str] = []
     if not frozen_tests:
@@ -1439,6 +1727,50 @@ def build_attestation(
                 f"frozen test file reported an incomplete tally: {rel} "
                 f"({reported} of {collected})"
             )
+    if not isinstance(process, dict):
+        reasons.append(
+            "the process configuration was not recorded, so this run cannot be "
+            "distinguished from one configured to lie about it"
+        )
+    elif plugin_baseline is None:
+        # The same rule a freeze with no test files already gets: with nothing to
+        # compare against, every plugin set is equally acceptable, which is the
+        # state this exists to end.
+        reasons.append("the freeze recorded no plugin baseline to compare against")
+    else:
+        realized = set(process.get("plugins") or {})
+        baseline_plugins = set(plugin_baseline)
+        for name in sorted(realized - baseline_plugins):
+            reasons.append(f"a plugin the freeze did not record was loaded: {name}")
+        for name in sorted(baseline_plugins - realized):
+            reasons.append(f"a plugin the freeze recorded was absent: {name}")
+        for index, worker in enumerate(process.get("workers") or ()):
+            # Against the BASELINE, never against the controller. Under -n auto
+            # the workers execute the tests the controller only records, so a
+            # controller-side reading describes an interpreter that ran nothing;
+            # and the controller legitimately carries plugins no worker does
+            # (xdist's dsession and terminaldistreporter) while the workers carry
+            # the nested conftests only a collecting process loads. Measured on
+            # 16 workers. Under the identity normalisation both fold into the
+            # same `dist:` entries, so this comparison is the stricter one it
+            # reads as: every worker must match the freeze, and therefore its
+            # siblings. The controller is held to the same set two loops above.
+            if not isinstance(worker, (list, tuple, set, frozenset)):
+                # The recorder ships None for a worker it could not describe, and
+                # this is the same rule the missing process block gets a few
+                # lines above: an interpreter nobody could describe is damage,
+                # not innocence. Under -n auto it is the interpreter that RAN the
+                # frozen tests, so silence here is worse than silence there.
+                reasons.append(
+                    f"xdist worker {index} could not be described, so what it "
+                    f"loaded is unknown"
+                )
+                continue
+            if set(worker) != baseline_plugins:
+                reasons.append(
+                    f"xdist worker {index} loaded a different plugin set than the "
+                    f"freeze recorded: {sorted(set(worker) ^ baseline_plugins)}"
+                )
     if exit_status != 0:
         reasons.append(f"pytest exited {exit_status}")
 
@@ -1450,6 +1782,7 @@ def build_attestation(
         "exit_status": exit_status,
         "attested_at": attested_at,
         "frozen_tests": {rel: dict(counts) for rel, counts in sorted(frozen_tests.items())},
+        "process": process,
     }
 
 
