@@ -26,12 +26,13 @@ this catches is tampering by helpfulness: the model hits a red assertion,
 concludes in good faith that the assertion is wrong, and edits it. A verification
 that merely runs catches that completely.
 
-Recipe `canopus-freeze-v3`, named in every manifest so a future algorithm change
+Recipe `canopus-freeze-v4`, named in every manifest so a future algorithm change
 breaks loudly instead of silently:
 
     file digest = sha256(LF-normalized bytes)
     dir digest  = sha256("".join(f"{relpath}\\n" for relpath in sorted members))
-    root hash   = sha256(canonical JSON of {recipe, anchor, files, dirs, baseline})
+    root hash   = sha256(canonical JSON of
+                         {recipe, anchor, anchor_repo, files, dirs, baseline})
 
 where a directory's members are those whose BASENAME matches one of the entry's
 recorded `names` patterns.
@@ -56,15 +57,43 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Iterable, Optional, Sequence, Tuple
 
 from scripts.utils.atomic import atomic_write_text
 
-RECIPE = "canopus-freeze-v3"
+RECIPE = "canopus-freeze-v4"
 FREEZE_DIRNAME = ".canopus"
 FREEZE_FILENAME = "freeze.json"
 HISTORY_FILENAME = "history.jsonl"
 ANCHOR_PREFIX = "canopus-anchor:"
+# The line `approve` writes above an anchor line when the freeze it is approving
+# was accepted under `--contract-satisfied`. Deliberately NOT a prefix of, and
+# not prefixed by, ANCHOR_PREFIX: read_anchor matches with
+# `startswith(ANCHOR_PREFIX)` and takes everything after it as the digest, so a
+# waiver written on the anchor line would be parsed as part of the hash.
+SATISFIED_PREFIX = "canopus-contract-satisfied:"
+
+# Where the anchor's repository stands RIGHT NOW, as measured by canopus_git and
+# judged by repo_binding_state below. Defined here rather than in canopus_git
+# because the judging half is pure and this module may never import the half that
+# runs subprocess. The last two values coincide with canopus_git's anchor-read
+# statuses on purpose: they describe the same fact about the world, and one
+# spelling is better than two.
+REPO_PRESENT = "in_repo"
+REPO_ABSENT = "no_repo"
+REPO_UNKNOWN = "no_git"
+
+# What a manifest records when the anchor was NOT inside a repository at freeze
+# time, and what an anchorless manifest carries. Never consulted in the second
+# case: resolve_anchor returns before the binding when there is no anchor.
+#
+# Read-only on purpose. This is a module-level fallback every binding reader
+# reaches for, so one in-place mutation would change it for the whole process:
+# every stored unbound root would stop matching and verify would report LOSS OF
+# LOCK over a tree where nothing moved. Callers that put it in a manifest copy it
+# with dict(), so what gets stored and serialized is always a plain dict.
+ANCHOR_REPO_UNBOUND = MappingProxyType({"in_repo": False, "identity": ""})
 
 # Tool-generated caches that live INSIDE a source tree. A recursive freeze that
 # captured these would bind the lock to artifacts no version control tracks: the
@@ -201,17 +230,62 @@ def dir_member_rels(
     )
 
 
+def anchor_binding(manifest: dict) -> dict:
+    """The manifest's anchor_repo binding, as a plain dict, never raising.
+
+    ONE accessor for every reader of that key, because the alternative has now
+    been measured eight times on this project: a guard applied to the function in
+    front of its author and not to the one beside it. `repo_binding_state` grew an
+    isinstance check in wire 2.2 while `root_hash` and `recompute` kept
+    `dict(manifest.get("anchor_repo") or ANCHOR_REPO_UNBOUND)`, and `dict` raises
+    on a string, a list and an integer alike (ValueError for the first two, a
+    TypeError for the third).
+
+    "read_freeze validates the shape first" is not an answer, and it is the same
+    answer that was rejected at `repo_binding_state`: a validator is a guarantee
+    about a DIFFERENT function. These three are called with manifests that never
+    passed through read_freeze — a dict built in a test, one handed in by a
+    caller, one carried across a version — and two of them sit under `freeze_gate`
+    and under the PreToolUse dispatcher, where a raise fails OPEN.
+
+    A malformed binding reads as UNBOUND rather than raising, which is the same
+    direction `repo_binding_state` already took: an unbound reading is judged
+    BROKEN the moment the anchor is found inside a repository, so nothing is
+    softened by answering instead of raising.
+
+    Returns a copy, always. The fallback is a MappingProxyType shared by the whole
+    process, and callers store what they get here into manifests they then
+    serialize.
+
+    An EMPTY dict reads as unbound too, and that is preservation rather than
+    taste: the three call sites all spelled `manifest.get("anchor_repo") or
+    ANCHOR_REPO_UNBOUND`, so `{}` already fell back to the default. Dropping the
+    falsy arm here would change the payload `root_hash` covers for such a
+    manifest, which is LOSS OF LOCK over a tree where nothing moved.
+    """
+    binding = manifest.get("anchor_repo")
+    if not isinstance(binding, dict) or not binding:
+        return dict(ANCHOR_REPO_UNBOUND)
+    return dict(binding)
+
+
 def root_hash(manifest: dict) -> str:
-    """sha256 over recipe, anchor path, sorted files, sorted dirs, sorted baseline.
+    """sha256 over recipe, anchor path, anchor_repo binding, sorted files, dirs, baseline.
 
     The baseline is in here deliberately. Outside the hash it could be edited
     down to 1 with no indicator moving, and a per-file expected item count that
     can be silently lowered is worse than none: it reports rigour it is not
     delivering.
+
+    The binding is in here for the same reason the baseline is: outside the hash
+    a builder edits `anchor_repo` to `in_repo: false`, wins the working-copy
+    fallback permanently, and the committed approval still matches. Inside it,
+    the edit changes the root and the approval stops matching.
     """
     payload = {
         "recipe": manifest["recipe"],
         "anchor": manifest.get("anchor") or "",
+        "anchor_repo": anchor_binding(manifest),
         "files": dict(sorted(manifest["files"].items())),
         "dirs": dict(sorted(manifest["dirs"].items())),
         "baseline": dict(sorted((manifest.get("baseline") or {}).items())),
@@ -351,6 +425,7 @@ def build_manifest(
     anchor: Optional[Path] = None,
     content_only: Iterable[Path] = (),
     baseline: Optional[dict] = None,
+    anchor_repo: Optional[dict] = None,
 ) -> dict:
     """Build a freeze manifest over *paths*, all relative to *root*.
 
@@ -426,6 +501,7 @@ def build_manifest(
         "label": label,
         "frozen_at": frozen_at,
         "anchor": str(validate_anchor_path(anchor, resolved_root)) if anchor else "",
+        "anchor_repo": dict(anchor_repo or ANCHOR_REPO_UNBOUND),
         "git_sha": "",
         "baseline": dict(sorted((baseline or {}).items())),
         "files": dict(sorted(files.items())),
@@ -480,10 +556,14 @@ def recompute(manifest: dict, root: Path) -> dict:
     return {
         "recipe": manifest["recipe"],
         "anchor": manifest.get("anchor") or "",
+        "anchor_repo": anchor_binding(manifest),
         "files": dict(sorted(files.items())),
         "dirs": dict(sorted(dirs.items())),
-        # Carried through verbatim: the baseline is a recorded expectation, not
-        # something disk can be re-measured for.
+        # Carried through verbatim, both of them: the baseline is a recorded
+        # expectation and the binding is a recorded measurement, and neither is
+        # something disk can be re-measured for. Any key root_hash reads and
+        # recompute omits makes the recomputed root differ from the stored one
+        # forever, which reads as LOSS OF LOCK over a tree where nothing moved.
         "baseline": dict(sorted((manifest.get("baseline") or {}).items())),
     }
 
@@ -537,6 +617,7 @@ ANCHOR_NONE = "none"
 ANCHOR_MISSING = "missing"
 ANCHOR_UNRECORDED = "unrecorded"
 ANCHOR_RECORDED = "recorded"
+ANCHOR_UNBOUND = "unbound"
 
 
 def read_anchor(anchor_path: Path) -> Tuple[str, Optional[str]]:
@@ -579,6 +660,71 @@ def read_anchor(anchor_path: Path) -> Tuple[str, Optional[str]]:
     return (ANCHOR_RECORDED, found) if found else (ANCHOR_UNRECORDED, None)
 
 
+def parse_anchor_waiver(text: str, root_digest: str) -> str:
+    """The waiver reason recorded beside *root_digest* in *text*, or "".
+
+    `--contract-satisfied` accepts a wholly green contract, which is the right
+    answer for a retake and the wrong one for a first freeze. Recording it only
+    in `.canopus/history.jsonl` left it in a gitignored directory one `rm -rf`
+    removes, so a claim about a waived refusal had no durable artifact behind
+    it. `approve` therefore writes it onto the anchor beside the approval it
+    belongs to, and this reads it back.
+
+    BOUND to a hash, never "the last waiver in the file". An anchor accumulates
+    one approval per retake, so a waiver taken three retakes ago must not be
+    reported against a freeze that earned its redness honestly. Full digests,
+    compared whole: a prefix comparison here would look rigorous and is not.
+
+    Takes TEXT rather than a path, because the artifact has two copies and the
+    committed one governs. Reading the blob is git's half of the job and lives in
+    canopus_git, which this module may never import; the parsing is the same
+    either way, and one parser is what keeps the two copies from being read by
+    two subtly different rules.
+    """
+    wanted = (root_digest or "").strip().lower()
+    if not wanted:
+        return ""
+    found = ""
+    pending = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(SATISFIED_PREFIX):
+            pending = stripped[len(SATISFIED_PREFIX):].strip()
+        elif stripped.startswith(ANCHOR_PREFIX):
+            # The pending waiver belongs to THIS approval and to no later one,
+            # so it is consumed here whether or not the hash matched.
+            if stripped[len(ANCHOR_PREFIX):].strip().lower() == wanted:
+                found = pending
+            pending = ""
+    return found
+
+
+def read_anchor_waiver(anchor_path: Path, root_digest: str) -> str:
+    """The waiver in the artifact's WORKING copy, or "".
+
+    The FALLBACK reader, and named as one. A waiver on the working file is an
+    uncommitted diff in another repository: visible to a human who looks, and
+    erasable with one `sed -i` or `git checkout --`. Measured, not reasoned:
+    deleting the `canopus-contract-satisfied:` line from the working artifact
+    dropped CONTRACT WAIVED off `canopus pack` while HEAD still carried it and
+    the lock and approval lines did not move. The reader that prefers the
+    COMMITTED copy is `resolve_anchor_waiver` in canopus_git; this one answers
+    where there is no committed copy to consult, and it is what `approve` wrote.
+
+    Answers rather than raising, matching read_anchor: an unreadable or non-UTF-8
+    artifact reads as "no waiver recorded", and the reader that decides the LOCK
+    has already called that artifact missing.
+    """
+    path = Path(anchor_path)
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ""
+    return parse_anchor_waiver(text, root_digest)
+
+
 def anchor_state(
     manifest: dict, override: Optional[str] = None
 ) -> Tuple[str, str, Optional[str]]:
@@ -600,16 +746,82 @@ def anchor_state(
     return (anchor, status, value)
 
 
+BINDING_INTACT = "intact"
+BINDING_BROKEN = "broken"
+
+
+def repo_binding_state(
+    manifest: dict, current_status: str, current_identity: str
+) -> Tuple[str, str]:
+    """Is the anchor still in the repository the freeze was taken against?
+
+    Pure string work. The measurement arrives from the caller for the same
+    reason approval_state's git status does: this module is imported by the
+    PreToolUse dispatcher on every write and may never reach for subprocess.
+
+    Five outcomes, and the third and fifth are the whole point of wire 2.2:
+
+      bound, same repository        intact
+      unbound, still no repository  intact (the plain-folder operator)
+      bound, a DIFFERENT repository broken
+      bound, no repository or no git broken, and this is the blinding case
+      unbound, now IN a repository  broken, because the freeze was taken blind
+
+    The fourth line is why RED and not amber. Amber exits 0, so a builder who
+    blinds the gate would still convert a red exit 1 into an amber exit 0 and
+    keep the entire payoff. The bypass has to cost more than doing nothing.
+
+    A manifest with no binding key at all reads as unbound rather than raising:
+    this is called from the gate, and a raise in the gate fails OPEN.
+    """
+    # Anything that is not a mapping reads as unbound, for the same reason the
+    # missing key does. A manifest that reached this function WITHOUT passing
+    # through read_freeze is exactly the case the guard exists for, and
+    # "_validate_manifest_shape already refuses that" is a guarantee about a
+    # DIFFERENT function. Measured: a bare truthiness test let a string, a list
+    # and an int through to `.get` and raised AttributeError, which the
+    # PreToolUse dispatcher does not catch, so the hook logged an advisory and
+    # CONTINUED while writes to frozen paths sailed past. The guard now lives in
+    # `anchor_binding`, shared with root_hash and recompute, because it was
+    # written here alone and its two siblings raised on the same input.
+    binding = anchor_binding(manifest)
+    was_bound = bool(binding.get("in_repo"))
+    recorded = str(binding.get("identity") or "")
+
+    if not was_bound:
+        if current_status == REPO_PRESENT:
+            return (BINDING_BROKEN,
+                    "the freeze recorded the anchor OUTSIDE any repository and it "
+                    "is inside one now, so the freeze was taken blind: release "
+                    "and re-freeze")
+        return (BINDING_INTACT, "")
+
+    if current_status != REPO_PRESENT:
+        return (BINDING_BROKEN,
+                f"the freeze recorded the anchor inside a repository and git now "
+                f"answers {current_status}, so the approval cannot be attributed")
+    if current_identity != recorded:
+        return (BINDING_BROKEN,
+                "the anchor is inside a different repository than the freeze "
+                "recorded")
+    return (BINDING_INTACT, "")
+
+
 def lock_state(report: dict, anchor_status: str, anchor_value: Optional[str]) -> str:
     """Resolve the three-state indicator from a verify report plus the anchor.
 
     No prefix comparison anywhere: a truncated digest that looks rigorous and is
     not is worse than a full one, because a builder with a shell can brute-force
     a short prefix by appending whitespace to a frozen file.
+
+    ANCHOR_UNBOUND is listed explicitly rather than left to the final line's
+    `anchor_value == recomputed_root` comparison. It would fall red there today,
+    by arithmetic on a None, and an invariant that holds by accident is one
+    refactor away from not holding.
     """
     if not report["held"]:
         return LOSS_OF_LOCK
-    if anchor_status == ANCHOR_MISSING:
+    if anchor_status in (ANCHOR_MISSING, ANCHOR_UNBOUND):
         return LOSS_OF_LOCK
     if anchor_status in (ANCHOR_NONE, ANCHOR_UNRECORDED):
         return LOCK_UNCONFIRMED
@@ -752,7 +964,7 @@ def _validate_manifest_shape(manifest: dict, path: Path) -> None:
     exactly those two and denies fail-closed; anything else falls through its
     outer catch-all, logs an advisory, and continues -- fail OPEN).
     """
-    for key in (*_STR_SCALAR_KEYS, "files", "dirs", "baseline"):
+    for key in (*_STR_SCALAR_KEYS, "files", "dirs", "baseline", "anchor_repo"):
         _require(key in manifest, f"freeze manifest at {path} is missing {key!r}")
 
     for key in _STR_SCALAR_KEYS:
@@ -869,6 +1081,23 @@ def _validate_manifest_shape(manifest: dict, path: Path) -> None:
             f"{rel!r} ({type(count).__name__}), expected an integer",
         )
 
+    binding = manifest["anchor_repo"]
+    _require(
+        isinstance(binding, dict),
+        f"freeze manifest at {path} has a non-dict 'anchor_repo' value "
+        f"({type(binding).__name__}), expected a dict",
+    )
+    _require(
+        "in_repo" in binding and isinstance(binding["in_repo"], bool),
+        f"freeze manifest at {path} has a missing or non-boolean "
+        f"anchor_repo['in_repo']",
+    )
+    _require(
+        "identity" in binding and isinstance(binding["identity"], str),
+        f"freeze manifest at {path} has a missing or non-string "
+        f"anchor_repo['identity']",
+    )
+
 
 def read_freeze(root: Path) -> Optional[dict]:
     """Load the active freeze manifest, or None when none is active.
@@ -922,6 +1151,7 @@ def append_history(
     digest: str,
     label: str,
     reason: str = "",
+    kind: str = "",
 ) -> None:
     """Append one line to the ledger. Never rewrites, never truncates.
 
@@ -949,6 +1179,11 @@ def append_history(
         "root": digest,
         "label": label,
         "reason": reason,
+        # Which KIND of release this was, for the two release events and empty
+        # for every other one. A release you will close and the end of a slice
+        # looked identical in this ledger before wire 2.2, so nothing could act
+        # on the difference and the gate stayed silent over an unlocked tree.
+        "kind": kind,
     }
     path = history_state_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -957,6 +1192,100 @@ def append_history(
     # append-only is the entire point of this ledger.
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def read_ledger(root: Path) -> list[dict]:
+    """Every readable line of the append-only ledger, oldest first.
+
+    Damaged lines are skipped rather than raising: the ledger is evidence, and a
+    reader that refuses to show the other nine entries because one is corrupt is
+    less useful than one that shows nine.
+
+    Lives beside the writer from wire 2.2, because the gate reads it now and the
+    gate may never import the pack (the pack reaches for git through
+    canopus_git, and this module is loaded by the PreToolUse dispatcher on every
+    write). Stdlib only, like everything else here.
+    """
+    path = history_state_path(root)
+    if not path.is_file():
+        return []
+    entries: list[dict] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        # ValueError covers UnicodeDecodeError, and OSError alone did not. A
+        # ledger holding one non-UTF-8 byte raised straight through this reader,
+        # so `canopus pack` tracebacked on a module whose docstring promises to
+        # answer rather than raise, and from wire 2.2 the same call is on
+        # freeze_gate's path, where a raise fails OPEN.
+        return []
+    for line in text.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+RELEASE_EVENTS = ("release", "force_release")
+# The events that take the lock or give it back. Everything else the ledger
+# carries (`approve`, `anchor_replaced`, `verify_fail`) describes a state without
+# changing who holds it, so it is stepped over rather than read as an answer.
+LOCK_EVENTS = ("freeze", *RELEASE_EVENTS)
+
+
+def last_lock_event(entries: Sequence[dict]) -> Optional[dict]:
+    """The most recent entry that took the lock or gave it back, or None.
+
+    One walk, read by both questions below. They are two readings of the SAME
+    fact and were one function's early return before wire 2.2: `open_release_window`
+    answered None the moment it saw a `freeze`, which is correct for its own
+    question and threw away the other answer entirely. That is how deleting
+    `.canopus/freeze.json` became QUIETER than releasing it, inverting the
+    incentive the ledger exists to create.
+    """
+    for entry in reversed(list(entries)):
+        if entry.get("event") in LOCK_EVENTS:
+            return entry
+    return None
+
+
+def open_release_window(entries: Sequence[dict]) -> Optional[dict]:
+    """The release window still standing open, or None.
+
+    A window is open when the LAST lock event in the ledger is a release that
+    named itself a window. A later freeze closes it, which is what makes the
+    gate's amber line self-clearing rather than something an operator learns to
+    dismiss.
+
+    An entry with no `kind` reads as a ship. Every entry written before wire 2.2
+    has none, and reading those as windows would turn a quiet past amber
+    retroactively on the first pytest run after the update.
+    """
+    entry = last_lock_event(entries)
+    if entry is None or entry.get("event") == "freeze":
+        return None
+    return entry if entry.get("kind") == "window" else None
+
+
+def unreleased_freeze(entries: Sequence[dict]) -> Optional[dict]:
+    """The freeze the ledger says is still held, or None.
+
+    Read beside a MISSING manifest and nowhere else, where the pair is the whole
+    signal: the ledger records a freeze that no release closed, and the manifest
+    that freeze wrote is not on disk. `rm .canopus/freeze.json` produces exactly
+    that pair, and before wire 2.2 nothing read it, so the sanctioned
+    `release --window` printed an amber line at every later pytest session start
+    while the deletion printed nothing at all.
+
+    `rm -rf .canopus` still says nothing, and that is a property of the
+    directory rather than a gap here: the ledger goes with it. This reader closes
+    the cheaper half, where the evidence survives.
+    """
+    entry = last_lock_event(entries)
+    return entry if entry is not None and entry.get("event") == "freeze" else None
 
 
 # ============================================================
