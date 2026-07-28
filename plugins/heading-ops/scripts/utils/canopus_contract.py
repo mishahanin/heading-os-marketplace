@@ -17,21 +17,52 @@ frozen:
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 from xml.etree import ElementTree
 
 from scripts.utils.canopus_gate import pytest_child_env
+# The child's half of the handshake, imported rather than spelled again. Two
+# copies of an environment-variable name is a rename on one side away from a
+# child that claims nothing, two runs that agree on a red the rule never fires
+# over, and a suite that stays green while the verdict is silently always empty.
+# Importing the plugin module runs no pytest hook: hooks are registered by
+# `-p`, not by import, and this module is stdlib-only.
+from scripts.utils.canopus_nullstub import (
+    MODULES_VAR,
+    NULLSTUB_STDERR_MARKER,
+    STUB_NAME_SEPARATOR,
+    VALUES_VAR,
+    _expand_claims,
+)
 
 DEFAULT_PATTERNS = ("test_*.py",)
 RED_OUTCOMES = ("failure", "error")
+
+# The only two exits a probe run can be READ from. 0 is all green; 1 is tests
+# failed, which is the ordinary state of an unimplemented contract under a stub.
+# Every other exit means the run measured something other than the contract:
+# 2 is interrupted, 3 is an internal error, 4 is a usage error, 5 is nothing
+# collected. Measured: an interrupted session exits 2 and still writes a PARTIAL
+# JUnit report, so a probe that reads the report without reading the exit code
+# computes its verdict over the survivors of a run that stopped early, and two
+# children truncated the same way AGREE with each other, which is the reading
+# that looks like a measurement.
+#
+# 5 is in the refused set deliberately, and it is not only an interruption case.
+# Measured: a contract file that skips at MODULE level under the stub exits 5
+# while xunit1 still writes ONE synthetic testcase named after the module, so the
+# population is not empty, the emptiness guard below cannot see it, and the
+# verdict came back carrying ('c/test_lost.py', 'c.test_lost'), an id that is
+# not a test and that a caller would print to the operator as a vacuous test.
+PROBE_RETURNCODES = (0, 1)
 
 
 class ContractError(Exception):
@@ -70,6 +101,140 @@ def contract_files(
     return sorted(found)
 
 
+CONFTEST_PATTERNS = ("conftest.py",)
+
+
+def contract_source_files(
+    paths: Sequence[Path],
+    root: Path,
+    patterns: Sequence[str] = DEFAULT_PATTERNS,
+) -> list[str]:
+    """The contract's own SOURCE: its test modules and the conftests beside them.
+
+    A separate accessor rather than a wider default on `contract_files`, because
+    the two answer different questions and only one of them may grow.
+    `contract_files` says which files are contract TESTS: it feeds the per-file
+    baseline the manifest records and the collected-nothing refusal. A conftest
+    yields no test items, so counting one there would record a baseline of zero
+    for a file that can never move off it, and every contract carrying a conftest
+    would be refused for collecting nothing.
+
+    A conftest IS contract source, and the AST reader has to see it. Measured
+    through the CLI: a fixture whose body is `from absent_thing import Widget`
+    puts the contract's only absent import in a file the `test_*.py` glob never
+    reads, so the claim set came back empty, nothing was stubbed, and `freeze`
+    took a contract whose one test asserted `len(widget.items()) == 0` against a
+    subject that did not exist. Building the subject in a fixture is ordinary
+    pytest, not an exotic shape.
+
+    A path named as a FILE brings its own directory's conftest with it, because
+    pytest loads that conftest for that file too. Only the immediate parent: a
+    directory argument is walked whole below, and climbing further from a file
+    argument would claim modules named by files the contract does not contain.
+    """
+    targets = list(paths)
+    for raw in paths:
+        target = Path(raw)
+        if target.is_dir():
+            continue
+        for pattern in CONFTEST_PATTERNS:
+            sibling = target.parent / pattern
+            if sibling.is_file():
+                targets.append(sibling)
+    return contract_files(targets, root, tuple(patterns) + CONFTEST_PATTERNS)
+
+
+_DYNAMIC_IMPORT_CALLEES = ("import_module", "__import__", "importorskip")
+
+
+def contract_imports(paths: Sequence[Path], root: Path) -> set[str]:
+    """Dotted module names the contract's own source imports.
+
+    Source means `contract_source_files`, so the contract's conftests are read
+    alongside its test modules; the reasoning is in that function's docstring.
+
+    Read from the AST rather than from the child's failure text, and that is the
+    whole slice. `try/except ImportError` around a plain `import` or `from`
+    statement erases the failure MESSAGE, so the revision this replaces saw
+    nothing to stub and the refusal could not fire. It cannot erase the import
+    STATEMENT itself, because the AST is what the interpreter executes: the node
+    is there whether or not the author routes around its exception.
+
+    That guarantee holds only for `import` and `from ... import ...` statements.
+    It does NOT hold for a dynamic import whose module name is computed at run
+    time: `importlib.import_module(name)`, `__import__(name)`,
+    `pytest.importorskip(name)` with `name` a variable emit no `Import` or
+    `ImportFrom` node at all, and there is no literal string here to collect
+    either. Nor does it hold for two other spellings of a name that IS known at
+    compile time: an f-string (`f"absent_thing"`) and a concatenation
+    (`"absent" + "_thing"`) are each their own AST node, not an `ast.Constant`,
+    so neither contributes a string this function can read. A third spelling of
+    the same idea, implicit adjacent concatenation (`"absent" "_thing"`), is
+    different: the parser folds it into one `ast.Constant` before this function
+    ever walks the tree, so that spelling IS collected. These missed forms,
+    among others, are unread by this function, and it fails OPEN on them:
+    never stubbed, never proved vacuous. Only the run-time-computed name
+    (`import_module(name)` with `name` a variable) is invisible to ANY
+    static reader; the other two are merely unread by this one, which reads
+    literal strings only. A callee that is neither a bare name nor a plain
+    attribute access, such as `registry["fn"]("absent_thing")` or a call built
+    through `getattr`, is skipped outright: `func` matches neither
+    `ast.Name` nor `ast.Attribute`, so `callee` is `None` and the call's
+    arguments are never inspected at all. What IS collected is every `str`
+    `ast.Constant` found among the positional
+    arguments and the keyword-argument values of those same three calls,
+    matched on the bare callee name rather than on the resolved object.
+    Matching by name over-reports rather than under-reports (a shadowed local
+    function named `import_module` also gets picked up), and over-reporting is
+    the safe direction here: a wider claim set can only turn a passing probe
+    test into a vacuity label, never hide one. The consumer is
+    `_passable_claims`, which tolerates the junk that direction produces rather
+    than assuming every element is an importable dotted name.
+
+    Relative imports are skipped: `from . import x` names no absolute module, and
+    a name no import statement can produce is a claim that can only be wrong.
+
+    A file that will not parse, or cannot be read as UTF-8, raises rather than
+    contributing nothing. An empty set here is a real answer ("this contract's
+    source names no module"), and `run_null_stub` refuses on it rather than
+    reading it as a verdict, so the two must not be conflated at this level.
+    """
+    modules: set[str] = set()
+    for rel in contract_source_files(paths, root):
+        path = Path(root) / rel
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError) as exc:
+            raise ContractError(
+                f"the contract file {rel} could not be parsed, so the imports it "
+                f"names could not be read: {exc}"
+            ) from exc
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module:
+                    modules.add(node.module)
+            elif isinstance(node, ast.Import):
+                modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name):
+                    callee = func.id
+                elif isinstance(func, ast.Attribute):
+                    callee = func.attr
+                else:
+                    callee = None
+                if callee in _DYNAMIC_IMPORT_CALLEES:
+                    candidates = list(node.args) + [
+                        kw.value for kw in node.keywords
+                    ]
+                    for value_node in candidates:
+                        if isinstance(value_node, ast.Constant) and isinstance(
+                            value_node.value, str
+                        ):
+                            modules.add(value_node.value)
+    return modules
+
+
 def _outcome(case: ElementTree.Element) -> str:
     for tag in ("failure", "error", "skipped"):
         if case.find(tag) is not None:
@@ -91,6 +256,42 @@ def _is_collection_failure(case: ElementTree.Element) -> bool:
     """
     error = case.find("error")
     return error is not None and error.get("message") == "collection failure"
+
+
+def _qualified_name(rel: str, classname: str, name: str) -> str:
+    """The test's name, carrying its class chain when it has one.
+
+    A report entry identifies a test by `(file, name)` everywhere in this module,
+    and under xunit1 `name` is the BARE method name with the class held separately
+    in `classname`. Measured: `class TestVacuous: def test_x` and `class
+    TestHonest: def test_x` in one file both arrive as `test_x`, collapse to one
+    pair, and the pair then lands in the vacuous set from the first and in the
+    case list from the second, so `cases <= vacuous` holds and a contract with one
+    honest test is refused whole. `class TestRead` beside `class TestWrite` is not
+    an adversarial shape.
+
+    The tuple is not widened, because the frozen contract asserts two-tuples such
+    as `{("c/test_one.py", "test_a")}`. The NAME is qualified instead, and only
+    when the classname says there is a class to qualify with. For a module-level
+    function xunit1 writes the MODULE's dotted path as the classname, so `test_a`
+    in `c/test_one.py` arrives as `classname="c.test_one"`, which matches the
+    path exactly and leaves the name alone; a method in `TestVacuous` arrives as
+    `classname="c.test_one.TestVacuous"`, and the tail becomes the prefix. The
+    WHOLE tail, not its last segment: `TestA.TestInner.test_x` and
+    `TestB.TestInner.test_x` are the same collision one level down.
+
+    Anything that does not begin with the module's own dotted path is left alone
+    rather than guessed at. A synthetic module-level entry carries no classname at
+    all, and a rootdir this function cannot reconstruct the dotted path under
+    would otherwise have its names rewritten on a coincidence.
+    """
+    if not classname:
+        return name
+    module = Path(rel).with_suffix("").as_posix().replace("/", ".")
+    prefix = module + "."
+    if classname.startswith(prefix):
+        return f"{classname[len(prefix):]}.{name}"
+    return name
 
 
 def _parse_report(xml_text: str) -> ElementTree.Element:
@@ -138,6 +339,10 @@ def parse_junit(xml_text: str) -> tuple[dict[str, int], list[tuple[str, str, str
 
     A DOCTYPE is refused before parsing, in the shared `_parse_report` entry
     point above, and the reasoning lives there.
+
+    A test method's name carries its class chain, per `_qualified_name` above:
+    two classes in one file may hold a method of the same name, and the bare name
+    collapses them into one identity.
     """
     counts: dict[str, int] = {}
     outcomes: list[tuple[str, str, str]] = []
@@ -148,7 +353,10 @@ def parse_junit(xml_text: str) -> tuple[dict[str, int], list[tuple[str, str, str
             continue
         rel = Path(rel).as_posix()
         counts[rel] = counts.get(rel, 0) + 1
-        outcomes.append((rel, case.get("name") or "", _outcome(case)))
+        name = _qualified_name(
+            rel, case.get("classname") or "", case.get("name") or ""
+        )
+        outcomes.append((rel, name, _outcome(case)))
     return counts, outcomes
 
 
@@ -160,6 +368,7 @@ def run_pytest_report(
     extra_env: Optional[dict] = None,
     extra_args: Sequence[str] = (),
     plugin_dump: Optional[Path] = None,
+    allowed_returncodes: Optional[Sequence[int]] = None,
 ) -> str:
     """Run pytest over *paths* once and return the raw JUnit XML.
 
@@ -170,10 +379,31 @@ def run_pytest_report(
     extra_env is merged over os.environ rather than replacing it, so the trace id
     a daemon exported still reaches the child (.claude/rules/trace-id.md).
 
+    Returns the XML and, on the way past, forwards any line of the child's stderr
+    that carries NULLSTUB_STDERR_MARKER. See the comment at that loop: it is the
+    stub plugin's report of an exception it swallowed, and this is the only place
+    it can still be read.
+
     `-o addopts=` neutralises the repository's configured addopts (coverage,
     parallel workers) so the report is deterministic and cheap. CANOPUS_NO_ATTEST
     stops the child session writing an attestation over the real one: `probe` can
     legitimately run while a freeze is held.
+
+    `--import-mode=importlib` is then restored EXPLICITLY, because `-o addopts=`
+    deletes the repository's pin along with the coverage flags it was aimed at,
+    and this child must read the contract in the same import mode the gate does.
+    Every Canopus slice writes its contract to
+    `tests/contract/{date}-{slug}/test_contract.py`, so the convention
+    GUARANTEES a basename collision between slices, which is exactly the class
+    pyproject.toml pins importlib to remove. Measured under the inherited
+    default: a contract spanning two slice directories collected one of its two
+    files, the other was silently dropped from the report, and the builder was
+    told to move imports that were already inside the test body. Not an escape,
+    because all three children of one verdict carry the same flags and every
+    guard compares like with like; the cost is a false diagnosis, and a gate
+    that misdiagnoses is one the operator learns to route around. The flag is
+    spelled here rather than left to `addopts` so the probe's mode is a property
+    of this command instead of a property of whatever config it inherits.
 
     `-o junit_family=xunit1` is LOAD-BEARING, not a style choice. pytest defaults
     to `junit_family=xunit2`, whose schema permits only name, classname, time,
@@ -206,9 +436,18 @@ def run_pytest_report(
     both, and it is also why the comparison is over distributions rather than
     over raw plugin names.
 
-    The return code is deliberately ignored. A contract that has not been
-    implemented yet EXITS NONZERO, and that is the state this function exists to
-    observe.
+    The return code is deliberately ignored BY DEFAULT. A contract that has not
+    been implemented yet EXITS NONZERO, and that is the state this function
+    exists to observe, so the baseline run reads its report whatever the child
+    exited with.
+
+    `allowed_returncodes` is how a caller that CANNOT tolerate a truncated report
+    says so, and only the null-stub probe does. Measured: a session interrupted
+    mid-run exits 2 and still writes a partial JUnit report holding one of its
+    three tests. The baseline would simply record a smaller contract; the probe
+    computes a differential over two populations, and two children truncated the
+    same way AGREE with each other, so the verdict is taken over the survivors
+    and reads exactly like a completed measurement. Refused there, ignored here.
     """
     resolved_root = Path(root).resolve()
     rels = [str(Path(p).resolve()) for p in paths]
@@ -218,6 +457,7 @@ def run_pytest_report(
             sys.executable, "-m", "pytest", *rels,
             "--junit-xml", str(report),
             "-o", "addopts=",
+            "--import-mode=importlib",
             "-o", "junit_family=xunit1",
             "--continue-on-collection-errors",
             "-p", "no:cacheprovider",
@@ -259,6 +499,25 @@ def run_pytest_report(
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ContractError(f"the contract could not be run: {exc}") from exc
+        # The child's stub diagnostics, forwarded rather than dropped. The stub
+        # plugin STUBS a claimed name whose resolution raised and reports the
+        # exception instead of propagating it, so this line is the only trace
+        # that anything went wrong at all. Discarded, a first-party module that
+        # blows up on import reaches the operator as a bare vacuity refusal with
+        # nothing to explain it. Scoped to the marker rather than echoing the
+        # whole stream: an ordinary contract run loads no plugin, writes no such
+        # line, and is unaffected.
+        #
+        # ONE CAUSE, TWICE ON THE STREAM, and that is expected rather than a
+        # second fault. This function forwards the stderr of the child it ran,
+        # and run_null_stub runs two stub children over the same claim set, so a
+        # name whose resolution raises reports once in each. Deduplicating here
+        # is not possible (this call sees one child) and deduplicating in the
+        # caller would hide the case where only ONE of the two runs hit it,
+        # which is the more interesting reading of the pair.
+        for line in (proc.stderr or "").splitlines():
+            if line.startswith(NULLSTUB_STDERR_MARKER):
+                print(line, file=sys.stderr)
         if not report.is_file():
             # The child's own words, or this is a diagnosis tool that refuses to
             # diagnose. Measured: `probe` is documented as runnable while a freeze
@@ -271,6 +530,22 @@ def run_pytest_report(
             raise ContractError(
                 f"pytest wrote no JUnit report, so the contract could not be "
                 f"measured (exit {proc.returncode}): {tail}"
+            )
+        if (
+            allowed_returncodes is not None
+            and proc.returncode not in allowed_returncodes
+        ):
+            # Checked AFTER the missing-report branch above, which says more: a
+            # child that wrote nothing at all names loss of lock, and that
+            # diagnosis should not be replaced by one about an exit code.
+            raise ContractError(
+                f"the probe child did not run the contract to completion: "
+                f"pytest exited {proc.returncode}, and only "
+                + " and ".join(str(code) for code in allowed_returncodes)
+                + " are exits a probe verdict can be read from (2 interrupted, "
+                "3 internal error, 4 usage error, 5 nothing collected). Its "
+                "JUnit report is therefore partial or empty, and a verdict read "
+                "from one is a verdict over whichever tests happened to run."
             )
         try:
             return report.read_text(encoding="utf-8")
@@ -368,143 +643,410 @@ def refusal_reasons(
     return reasons
 
 
-_MISSING_PATTERN = re.compile(r"No module named ['\"]([A-Za-z_][A-Za-z0-9_.]*)")
-# The other half of "the code under test is not there yet". A module file that
-# exists but does not yet carry the name the contract imports raises
-# `ImportError: cannot import name 'x' from 'y'`, which the pattern above does not
-# match at all. Without this the probe returns an empty name set for every
-# partially built module, run_null_stub does nothing, and vacuity_refusal can
-# never fire in exactly the mid-build state where a retake is taken.
-_MISSING_NAME_PATTERN = re.compile(
-    r"cannot import name ['\"][A-Za-z_][A-Za-z0-9_]*['\"] from "
-    r"['\"]([A-Za-z_][A-Za-z0-9_.]*)"
-)
+# The two characters a claim may not contain, and why each is refused. The
+# separator is the wire format: a string carrying it would arrive in the child as
+# two fragments the contract never named, and a fragment can claim a module that
+# EXISTS, replacing real values with stand-ins for the length of the probe. The
+# NUL cannot cross the process boundary at all: an environment value holding one
+# raises `ValueError: embedded null byte` out of `subprocess`, which is not the
+# `ContractError` this module promises its callers, so the CLI that catches
+# `ContractError` would die with a traceback instead of a refusal.
+#
+# Neither can appear in an importable dotted name, so dropping loses no claim
+# that could ever have been imported, and claims nothing the contract did not
+# write. Task 1's AST reader over-reports on purpose, which is what puts strings
+# like these in the set in the first place.
+_UNPASSABLE_IN_A_CLAIM = (STUB_NAME_SEPARATOR, "\x00")
 
 
-def missing_modules(xml_text: str) -> set[str]:
-    """FULL dotted module names the contract run could not import.
+def _passable_claims(collected: set[str]) -> list[str]:
+    """The collected strings that can survive the trip to the child, sorted.
 
-    Read out of the failure messages the child itself produced, rather than
-    resolved in this process: the child's sys.path is the one that matters, and
-    it is not necessarily ours.
+    `contract_imports` OVER-reports by design, and some of what it returns was
+    never a module name: every string constant among a dynamic import's
+    arguments is collected, so `pytest.importorskip("x", reason="needs, the
+    thing")` contributes the prose too, and `__import__("a\\x00b")` contributes a
+    string no environment can carry. Both are dropped rather than escaped, for
+    the reasons recorded at `_UNPASSABLE_IN_A_CLAIM` above.
 
-    The dot belongs in the character class. Truncating at the first segment turns
-    one absent `scripts.utils.canopus_git` into a stub over the entire `scripts`
-    package, so modules that exist are mocked away, every test passes, and a good
-    contract is refused as vacuous.
+    The drop is reported, because a claim silently removed is a verdict silently
+    widened.
 
-    The text read here is text the contract's own test code can shape, and the
-    two directions are NOT symmetrical. Be exact about both, because an earlier
-    revision of this docstring claimed "the direction is fail-closed" without
-    qualification and that was true of only one of them.
-
-    WIDENING is the safe one. A test that merely mentions the literal string
-    `No module named 'scripts'` gets that package stubbed for the probe run; a
-    wider stub can only turn a passing probe test into a vacuity label, never
-    hide one. The names reach the child through an environment variable only,
-    never through argv.
-
-    NARROWING is author-controlled and FAIL-OPEN, and it costs one keyword:
-
-        def test_vacuous():
-            try:
-                from absent_thing import answer
-            except ImportError:
-                raise AssertionError('not implemented yet') from None
-            assert answer() is not None
-
-    `from None` suppresses the chained traceback, so the child's failure text
-    never carries `No module named 'absent_thing'`, this function returns an
-    empty set, `run_null_stub` returns immediately with nothing stubbed, and
-    `vacuity_refusal` cannot fire over a contract every test of which asserts
-    nothing. Measured: freeze exits 0 and writes a manifest. Without `from None`
-    the chained ModuleNotFoundError leaks into the report and the refusal fires
-    correctly.
-
-    Nothing here closes that, and pretending otherwise is worse than naming it:
-    the instrument reads the child's own words, and the contract author writes
-    the child. What the callers DO about it is refuse to stay silent: see
-    `vacuity_unmeasured` below, which the operator-facing commands print when a
-    red contract names no absent module at all, so a probe that measured
-    nothing never reads like a probe that measured vacuity and found none.
+    Sorted so the value handed to the child is a function of the set alone. Two
+    runs of the same contract that differ only in iteration order would otherwise
+    be two different probes.
     """
-    root = _parse_report(xml_text)
-    found: set[str] = set()
-    for case in root.iter("testcase"):
-        for child in case:
-            message = child.get("message") or ""
-            text = child.text or ""
-            for blob in (message, text):
-                found.update(_MISSING_PATTERN.findall(blob))
-                found.update(_MISSING_NAME_PATTERN.findall(blob))
-    return found
+    passable = sorted(
+        name for name in collected
+        if not any(bad in name for bad in _UNPASSABLE_IN_A_CLAIM)
+    )
+    for name in sorted(collected - set(passable)):
+        print(f"canopus: the contract names {name!r} where a module name was "
+              f"expected, and it carries a character this probe cannot pass a "
+              f"name with, so it is not claimed", file=sys.stderr)
+    return passable
+
+
+def _counts_by_file(outcomes: Sequence[tuple[str, str, str]]) -> dict[str, int]:
+    """How many items each file yielded, read off the per-test outcomes.
+
+    `parse_junit` appends an outcome and bumps a count in the same loop
+    iteration, so this is equal to the counts it returns; deriving it here lets
+    the probe treat a caller-supplied population and its own baseline run
+    identically, instead of carrying counts for one and inferring them for the
+    other.
+    """
+    counts: dict[str, int] = {}
+    for rel, _name, _outcome_token in outcomes:
+        counts[rel] = counts.get(rel, 0) + 1
+    return counts
 
 
 def run_null_stub(
     paths: Sequence[Path],
     root: Path,
-    modules: Iterable[str],
     *,
     timeout: int = 900,
+    expected_population: Optional[Sequence[tuple[str, str, str]]] = None,
 ) -> set[tuple[str, str]]:
-    """The (file, test) pairs that PASS with every absent module mocked.
+    """The (file, test) pairs that pass under BOTH stub value sets.
 
-    Each one is proved to assert nothing. Returns an empty set when there is
-    nothing to stub, which is the ordinary state of a mid-build retake where the
-    implementation already imports.
+    Each one is proved to assert nothing about the code under test: it passed
+    while the implementation was absent, and its outcome did not change when the
+    stub's values changed, so it cannot be reading those values.
+
+    Two runs, not one, and the second is not belt-and-braces. Measured: under a
+    single stub `assert len(result) == 0` passes and earns a vacuity label it did
+    not deserve, along with `assert key not in result` and `assert int(v) == 1`.
+    Nine of nine assertions classify correctly under the differential rule; four
+    are wrong under the single-stub rule, every one toward refusing a good
+    contract, which is the direction that teaches a builder to route around the
+    gate.
+
+    The stub set comes from the contract's own AST, over its test modules AND its
+    conftests. Nothing the child SAYS is read; its JUnit report is, for the
+    outcomes, and the distinction is the point rather than a caveat. An outcome is
+    pytest's verdict on a test; the prose the earlier revision parsed was the
+    contract author's.
+
+    A claim set that comes back EMPTY raises rather than returning an empty
+    verdict. Nothing was stubbed there, so nothing was measured, and the empty set
+    a caller would have received is the same value a completed measurement that
+    found nothing vacuous returns.
+
+    One escape family stays open, by construction rather than by oversight: a
+    claimed module that EXISTS and whose own body raises at import time is never
+    stubbed, so its test stays red for its original reason and never enters the
+    intersection. A claimed PACKAGE whose `__init__` imports a module the
+    contract never named is the same shape, because the package resolves, the
+    wrapping loader runs its body, and the body raises. Both measured through
+    this function, and both returned an empty verdict. The neighbouring case
+    behaves differently and is worth telling apart: when that unwritten module
+    lies BELOW the claimed package it is already claimed by the prefix rule, so
+    it IS stubbed and its test is labelled, which was measured too.
+
+    So a refusal must never be read as "your test asserts nothing" on its own.
+    For this family vacuity was not measured at all, and the truth may be that
+    the contract's own package does not import; `vacuity_refusal` says so in the
+    text it returns. The claim set is what the contract's AST named, and this is
+    the price of that. The child reports what it swallowed on stderr, and
+    run_pytest_report forwards it, so the operator has the thread to pull.
+
+    `expected_population` is the REAL run's `(file, test, outcome)` triples, and
+    it is optional because the documented two-argument call must keep working AND
+    must keep the guards below armed. Every other guard here reads the two stub
+    runs against EACH OTHER, and two runs truncated the same way agree; the real
+    run is the only witness to which tests were supposed to be there at all. So
+    when the caller supplies none, this function RUNS ONE: an unstubbed baseline
+    over the same paths, whose population and per-file counts are then the real
+    ones. That is a third pytest session per verdict, which is the cost the plan
+    budgeted rather than a new one, and the alternative is a two-argument call
+    whose guards are silently off.
+
+    That baseline is `run_contract` over the same paths, which is exactly what a
+    caller supplying `expected_population` ran to obtain it, so supplying it and
+    omitting it produce the same verdict rather than two dialects of one probe.
+    It deliberately does NOT carry the stub runs' PYTHONPATH additions: the two
+    runs are then the same measurement a caller would have made, and the stub is
+    the only difference this function reads.
+
+    THE PRICE, stated so a caller can budget it: three pytest sessions per
+    verdict, or two when the caller supplies `expected_population`. TIMEOUT IS
+    PER CHILD, so the worst case is three times the caller's value.
     """
-    names = sorted(set(modules))
-    if not names:
-        return set()
+    modules = _passable_claims(contract_imports(paths, root))
+    if not modules:
+        # Nothing was stubbed, so nothing was measured, and an empty verdict from
+        # that state is not evidence. Returning `set()` here was the same silent
+        # acquittal the guards below refuse, one step earlier: the caller cannot
+        # tell it from "measured, and nothing was vacuous", so it printed no
+        # vacuity word, exited 0, and wrote the manifest. Measured through the
+        # CLI on `def test_a(): assert 1 == 2`, and on a contract whose only
+        # absent import lived in a fixture in its conftest.
+        raise ContractError(
+            "the contract's source names no module this probe could stand in "
+            "for, so nothing was stubbed and vacuity was NOT measured: the "
+            "contract's redness has not been shown to mean anything. A contract "
+            "that never names the code under test cannot be shown to assert "
+            "something about it. Import the code under test inside the test "
+            "body or a fixture; if the contract reaches it only through a name "
+            "computed at run time, spell that name in a plain import statement "
+            "too, so this probe can read it."
+        )
+    files = contract_files(paths, root)
+    # A stub standing in for the contract's OWN package would poison collection
+    # silently. A stub lands in sys.modules and is returned by every later
+    # import_module even after the finder is gone, because sys.modules is read
+    # before sys.meta_path; under `--import-mode=importlib` pytest builds each
+    # collected module's parent packages through exactly that path, and that is
+    # the mode the probe child runs in, pinned on its own command line in
+    # `run_pytest_report` rather than inherited from a config it neutralises.
+    # (The blocker was originally measured by FORCING the flag onto a child that
+    # then inherited whatever mode its config carried; it now describes the
+    # running probe.) `__path__` is
+    # refused, but `__getattr__` answers everything else, so the damage is
+    # invisible rather than mock-shaped. This repository's `pythonpath = ["."]`
+    # makes `tests` resolve, so the prefix filter never claims it and the case
+    # cannot arise today; it arises under a different rootdir, so the refusal is
+    # written now rather than left as a property of one config file.
+    #
+    # Intersected against the EXPANDED claim set, not the literal one, and that
+    # is the difference between a guard and a decoration. Prefix expansion
+    # happens in the child, so a contract importing `<own_top>.helper` spells no
+    # literal `<own_top>` at all while the child claims it as an unresolvable
+    # prefix and stands a stub in for the contract's own package: exactly the
+    # different-rootdir case the paragraph above says this refusal was written
+    # for, and the one shape the literal intersection could not see.
+    #
+    # `_expand_claims` rather than a syntactic walk over every dotted prefix,
+    # because the child's rule is what has to be predicted here and it
+    # deliberately leaves a prefix that RESOLVES TO A PACKAGE to `PathFinder`.
+    # A syntactic walk would refuse a contract for a stub the child never
+    # installs. The cost of borrowing the child's own function is named: it
+    # resolves names in THIS process, so an ancestor package's `__init__` runs
+    # here too, and it resolves under the parent's `sys.path` rather than the
+    # child's extra PYTHONPATH entries, so a name importable only from the
+    # contract root reads as unresolvable and is claimed. The first of those
+    # costs was measured false for one release: `_expand_claims`'s handler
+    # named only `Exception`, so an ancestor's ordinary `sys.exit(0)` walked
+    # past it, past this function, and past `cmd_freeze`'s own `except
+    # ContractError` — there is no child process boundary here to contain the
+    # escape the way there is inside the probe — and the CLI exited 0 having
+    # measured nothing. `_expand_claims` now catches `SystemExit` alongside
+    # `Exception` for exactly this call site, so both costs push toward
+    # claiming more, which can only refuse a contract, never wave one through.
+    own_packages = {rel.split("/", 1)[0] for rel in files if "/" in rel}
+    collision = own_packages & _expand_claims(modules)
+    if collision:
+        raise ContractError(
+            "the contract imports a name that is also a package prefix of its own "
+            "files, so stubbing it would stand in for the contract itself: "
+            + ", ".join(sorted(collision))
+        )
+    # The ENGINE root is where the plugin lives (`-p scripts.utils.canopus_nullstub`
+    # must import); the CONTRACT root makes the tree's own modules importable, so a
+    # named module that exists is WRAPPED rather than stubbed whole.
     engine_root = str(Path(__file__).resolve().parent.parent.parent)
-    env = {
-        "CANOPUS_STUB_MODULES": ",".join(names),
+    base_env = {
+        MODULES_VAR: STUB_NAME_SEPARATOR.join(modules),
         "PYTHONPATH": os.pathsep.join(
-            [engine_root, os.environ.get("PYTHONPATH", "")]
+            [engine_root, str(Path(root).resolve()),
+             os.environ.get("PYTHONPATH", "")]
         ).rstrip(os.pathsep),
     }
-    xml_text = run_pytest_report(
-        paths, root, timeout=timeout, extra_env=env,
-        extra_args=("-p", "scripts.utils.canopus_nullstub"),
+    # The REAL run, which is what every guard below is measured against. Taken
+    # after the collision refusal above, so the cheap refusal still costs nothing,
+    # and before the stub runs, so a contract that cannot be measured at all is
+    # not measured twice under a stub first.
+    if expected_population is None:
+        _real_counts, real_outcomes = run_contract(paths, root, timeout=timeout)
+    else:
+        real_outcomes = list(expected_population)
+    # Derived from the outcomes in BOTH cases rather than taken from parse_junit
+    # in one and derived in the other. parse_junit appends an outcome and bumps a
+    # count in the same loop iteration, so the two are equal by construction, and
+    # one expression here is one thing to keep true instead of two.
+    real_counts = _counts_by_file(real_outcomes)
+    populations = []
+    unproved_each = []
+    counts_each = []
+    errored_each = []
+    for label in ("A", "B"):
+        xml_text = run_pytest_report(
+            paths, root, timeout=timeout,
+            extra_env={**base_env, VALUES_VAR: label},
+            extra_args=("-p", "scripts.utils.canopus_nullstub"),
+            allowed_returncodes=PROBE_RETURNCODES,
+        )
+        counts, outcomes = parse_junit(xml_text)
+        counts_each.append(counts)
+        populations.append({(rel, name) for rel, name, _o in outcomes})
+        # Kept only to REPORT the instrument's own hand on stderr below. It
+        # decides nothing: an errored test is labelled by the unproved rule that
+        # follows, exactly like a skipped one.
+        errored_each.append(
+            {(rel, name) for rel, name, outcome in outcomes if outcome == "error"}
+        )
+        # "passed" is not the whole of "was not proved to assert anything".
+        # Measured on the prototype: `pytest.skip("not implemented yet")` at the
+        # top of a vacuous test yields `skipped` under BOTH runs, so it never
+        # enters an intersection of PASSES and the freeze proceeds. That is a
+        # one-call bypass, cheaper than the `from None` this slice closes, and it
+        # is a recurrence: wire 2.3 already found that a skipped test is never in
+        # the vacuous set. A test that did not run was not proved innocent.
+        #
+        # `error` is in this set for the same reason, and it is a REVERSAL of the
+        # previous revision, which refused the whole contract on any errored test.
+        # Review measured that refusal against five realistic contract shapes and
+        # it fired on four, three of them fully honest: a fixture calling
+        # `json.loads(RAW)`, `Path(ROOT) / "x"`, `re.compile(PATTERN)`, or
+        # `datetime.strptime(STAMP, ...)` errors the moment the stub reaches a
+        # library that type-checks its argument. Building the subject in a fixture
+        # is ordinary pytest and the authoring rule permits it, so a blanket
+        # refusal lands squarely on it, and a gate that refuses that is one the
+        # operator routes around, after which the gate proves nothing while
+        # looking as though it does.
+        #
+        # The three answers, and why this one:
+        #   * ACQUIT an errored test and the escape is arithmetic: a contract of
+        #     one vacuous test that passes and one vacuous test that errors is not
+        #     WHOLLY vacuous by the caller's subset test, so it freezes.
+        #   * REFUSE the contract and one fixture touching a stdlib API costs a
+        #     good multi-test contract everything.
+        #   * NAME IT PER TEST and the cost is that one test's innocence, on the
+        #     rule the skip case already settles: an outcome invariant to the stub
+        #     value was not proved innocent. A contract carrying any test that
+        #     asserts something is unaffected, because that test is not in this
+        #     set.
+        # An error in ONE run beside a pass in the other is named too, which is
+        # the same over-reach the skip rule already carries, and the stderr report
+        # below is what keeps it visible rather than silent.
+        unproved_each.append(
+            {(rel, name) for rel, name, outcome in outcomes
+             if outcome in ("passed", "skipped", "error")}
+        )
+    # An intersection is only evidence over one population. Two runs that
+    # collected different tests were never compared, and two that collected
+    # nothing measured nothing; both reach the same empty verdict, which reads
+    # exactly like "measured, and nothing was vacuous". Refused instead, because
+    # the quiet reading is the one that freezes a contract asserting nothing.
+    if populations[0] != populations[1]:
+        raise ContractError(
+            "the two stub runs did not measure the same tests, so their verdicts "
+            "cannot be compared: "
+            + ", ".join(
+                f"{rel}::{name}"
+                for rel, name in sorted(populations[0] ^ populations[1])
+            )
+        )
+    if not populations[0]:
+        raise ContractError(
+            "the stub runs collected no test at all, so nothing was proved "
+            "either way: vacuity was NOT measured, which is not the same claim "
+            "as measured and found absent"
+        )
+    # What the stub runs LOST relative to the real run. The guard above compares
+    # the two stub runs with each other, and two runs that lost the same thing
+    # agree, so it sees nothing; this compares them with the run that knows what
+    # was supposed to be there.
+    #
+    # It is one guard rather than a file-level one and a test-level one, and the
+    # merge is the point. The revision this replaces asked whether a contract file
+    # still had a KEY in the stub runs' per-file counts, which one surviving test
+    # satisfies. Built and measured, one file and two tests, both vacuous: a
+    # module-scope `HIDDEN = (mod.X == mod.Y)` guarding the second test's `def` is
+    # answered the same way under BOTH stub value sets, so the stub runs collected
+    # 1 where the real run collected 2, the two stub runs agreed with each other,
+    # the exit code was 1, no test errored, the verdict named one pair, the
+    # caller's subset test failed, and the contract FROZE.
+    #
+    # The comparison is over the real run's RED tests BY NAME, not over raw
+    # per-file counts, and the two differ in exactly two places.
+    #   * A red test lost while the file's COUNT holds. Measured: a file that
+    #     skips at MODULE level under the stub is recorded by xunit1 as ONE
+    #     synthetic testcase named after the module, so the count is unchanged and
+    #     only the names show the loss. A count comparison is blind there.
+    #   * A GREEN test lost. Only RED tests are weighed, the same evidence rule
+    #     the rest of this probe follows: a test that PASSED for real never had an
+    #     absent import for the stub to resolve, so nothing vacuous can hide in
+    #     its absence, and refusing on it would be an accusation the instrument
+    #     manufactured. A raw count comparison cannot tell which colour it lost,
+    #     so it would refuse there too.
+    # Counts are still what the operator is TOLD, because "2 became 1" is the
+    # sentence that points at the module-scope statement.
+    #
+    # A file the REAL run also lost is not the stub's doing and cannot appear
+    # here: it recorded no red test for that file, so there is nothing to miss.
+    # `refusal_reasons` owns that file and diagnoses it correctly. Blaming the
+    # stub for it states something false, and on `probe`, which calls this
+    # function unconditionally before any table is printed, it aborted the whole
+    # command and handed the operator the wrong cause.
+    lost = sorted(
+        f"{rel}::{name}"
+        for rel, name, outcome in real_outcomes
+        if outcome in RED_OUTCOMES and (rel, name) not in populations[0]
     )
-    _counts, outcomes = parse_junit(xml_text)
-    return {
-        (rel, name) for rel, name, outcome in outcomes if outcome == "passed"
-    }
-
-
-def vacuity_unmeasured(
-    outcomes: Sequence[tuple[str, str, str]], modules: Iterable[str]
-) -> str:
-    """One sentence when the vacuity instrument did not run, or "" when it did.
-
-    A red contract that names NO absent module leaves `run_null_stub` with
-    nothing to stub, so it returns an empty set, `vacuity_refusal` finds no
-    vacuous test, and the freeze proceeds. Two very different worlds reach that
-    same silence: a contract genuinely failing on assertions against code that
-    already exists, and a contract that hid its absent module from the report
-    (see `missing_modules` above, `from None`). This function does not tell them
-    apart, and it does not try.
-
-    It is deliberately NOT a refusal. Tests failing on assertions against
-    existing code are a legitimate, ordinary contract, and refusing there would
-    make the tool something builders route around. What it removes is the
-    silence: a measurement that did not happen is reported as one, rather than
-    read as a measurement that came back clean.
-    """
-    if not any(outcome in RED_OUTCOMES for _rel, _name, outcome in outcomes):
-        return ""
-    if sorted(set(modules)):
-        return ""
-    return (
-        "vacuity was NOT measured: the contract is red but its report names no "
-        "absent module, so no mock could stand in for one and no test could be "
-        "proved to assert nothing. That is not the same as measuring vacuity "
-        "and finding none. Ordinary when the contract fails on assertions "
-        "against code that already exists; also what a suppressed exception "
-        "chain (`raise ... from None` around the import) looks like."
+    if lost:
+        shrank = sorted(
+            f"{rel} (the real run collected {real_counts[rel]}, the stub runs "
+            + " and ".join(str(counts.get(rel, 0)) for counts in counts_each)
+            + ")"
+            for rel in {rel for rel, _name, _o in real_outcomes}
+            if any(counts.get(rel, 0) != real_counts[rel] for counts in counts_each)
+        )
+        raise ContractError(
+            "vacuity was NOT measured for tests the real run recorded red, "
+            "because the stub runs never collected them: "
+            + ", ".join(lost)
+            + ". Not measured is not proved innocent, and an intersection "
+            "computed over the survivors reads exactly like a clean verdict."
+            + (
+                " The stub is what lost them, and the per-file tally says where: "
+                + ", ".join(shrank)
+                + ". Most often a module-scope statement reads a value from a "
+                "module the contract also names a child of, which this probe must "
+                "stub whole; move that statement inside the test body."
+                if shrank else ""
+            )
+        )
+    # The instrument's own contribution, said out loud. An errored test is named
+    # vacuous by the unproved rule above, and an error is most often this probe's
+    # stub meeting a library that type-checks its argument rather than anything
+    # the contract did, so an operator reading a vacuity refusal has to be able to
+    # see which entries came from the instrument. Reported, never refused: the
+    # reversal that made this a label is argued at that rule.
+    errored = sorted(
+        f"{rel}::{name}" for rel, name in errored_each[0] | errored_each[1]
     )
+    if errored:
+        print(
+            "canopus: these contract tests ERRORED under the stub rather than "
+            "passing or failing, so they are named vacuous on the rule that an "
+            "outcome invariant to the stub value was not proved innocent, and an "
+            "error is often this probe's own stand-in reaching a caller that "
+            "type-checks it: " + ", ".join(errored),
+            file=sys.stderr,
+        )
+    return unproved_each[0] & unproved_each[1]
 
+
+# One advisory used to stand here, and it is DELETED rather than left unused. It
+# said "the contract is red and its report names no absent module, so nothing
+# could be stubbed", reading that name set off the reader of the child's failure
+# text that this module no longer carries either.
+#
+# The state it described is REACHABLE. An earlier revision of this comment
+# claimed the AST reader made it unreachable, and review measured that false: the
+# claim set is empty whenever the contract's source names no importable module at
+# all (a test that imports nothing, a contract whose only import is relative), and
+# whenever every name it does read is dropped as unpassable. What changed is not
+# that the state went away but where it LANDS. It used to be an advisory printed
+# beside an exit 0, which reads as a clean bill; it is now a `ContractError` out
+# of `run_null_stub`, like every other state in which nothing was measured, and
+# the callers turn those into refusals. Two families stay outside even that: a
+# name computed at run time is invisible to any static reader, and a claimed
+# module that EXISTS and raises on import is never stubbed. Both fail OPEN, and
+# both are argued where they arise rather than here.
 
 _IMPORT_MARKERS = ("ModuleNotFoundError", "ImportError")
 
@@ -540,6 +1082,13 @@ def parse_failure_modes(xml_text: str) -> dict[tuple[str, str], str]:
         name = case.get("name")
         if not rel or not name:
             continue
+        # The same key space `parse_junit` builds, through the same helper. A
+        # caller looks a mode up by the id the outcome list carries, so a reader
+        # that qualified a method name and one that did not would miss on every
+        # method and print no mode at all.
+        name = _qualified_name(
+            Path(rel).as_posix(), case.get("classname") or "", name
+        )
         for child in case:
             if child.tag not in ("failure", "error"):
                 continue
@@ -573,6 +1122,28 @@ def vacuity_refusal(
     tests assert nothing" is a decision for a human. A test that legitimately
     asserts absence lands on that list, and striking it off by eye is cheap;
     teaching the probe to tell the two apart is not.
+
+    THE TEXT NAMES THE OTHER READINGS, and that sentence is load-bearing rather
+    than a courtesy. The reader of this refusal is about to edit a test, and
+    three separate worlds arrive here wearing the same label.
+      * A module the contract named is stood in for whenever it does not
+        resolve, and "does not resolve" covers an unwritten implementation, an
+        extra that is not installed, and a first-party circular import that made
+        the resolution raise. The probe cannot separate them, and the direction
+        is toward refusal rather than acceptance, so it can only cost a correct
+        contract an argument, never wave a bad one through. An operator who is
+        not told will edit a correct test.
+      * A test that ERRORED under both stub runs is in `vacuous` on the rule
+        that an outcome invariant to the stub value was not proved innocent, and
+        an error is most often this probe's own stand-in reaching a caller that
+        type-checks its argument (`json.loads`, `Path`, `re.compile`,
+        `datetime.strptime`). When every entry arrived that way, "the contract's
+        redness asserts nothing" is FALSE: it was not measured. This function
+        receives outcomes from the REAL run and cannot tell which entries those
+        were, so it names the reading unconditionally instead of asserting the
+        one it cannot prove; `run_null_stub` lists the errored tests on stderr.
+    One string rather than a second list element, because the caller prints one
+    line per reason and a second element would read as a second defect.
 
     Only tests that were RED in the real run are weighed, and the filter is about
     EVIDENCE rather than leniency. The stub proves a test vacuous by making its
@@ -611,6 +1182,13 @@ def vacuity_refusal(
         return [
             "every contract test that is red passes with the code under test "
             "mocked away, so the contract's redness asserts nothing: it measures "
-            "that the code is absent, not that the tests check anything"
+            "that the code is absent, not that the tests check anything. Before "
+            "editing a test, rule out the readings this probe cannot tell apart: "
+            "a module it named is stood in for whether the implementation is "
+            "unwritten, an extra is not installed, or a first-party circular "
+            "import made the resolution raise; and a test that ERRORED under "
+            "both stub runs is named here because its outcome did not move with "
+            "the stub value, which is not measured rather than proof that it "
+            "asserts nothing (the probe lists those tests on stderr)."
         ]
     return []

@@ -1583,14 +1583,21 @@ def unreleased_freeze(entries: Sequence[dict]) -> Optional[dict]:
 # what proved unreliable.
 
 ATTEST_FILENAME = "attest.json"
-# v2 from wire 2.3: the record now carries a `process` block and is refused when
-# the plugin set differs from the one the freeze captured. A v1 record reads NOT
-# ATTESTED through the recipe check in `attestation_state` below, which is the
-# fail-closed direction and needs no migration: a record written before the
-# comparison existed cannot testify about a comparison it never made.
-ATTEST_RECIPE = "canopus-attest-v2"
+# v3 from wire 3.2: the record now carries a `tree` key describing the whole
+# working copy at finish, not just the frozen bytes, and is refused when it
+# cannot be described or when it moved between start and finish. A v2 record
+# reads NOT ATTESTED through the recipe check in `attestation_state` below,
+# which is the fail-closed direction and needs no migration: a record written
+# before the tree was captured cannot testify about a comparison it never made.
+ATTEST_RECIPE = "canopus-attest-v3"
 ATTESTED = "ATTESTED"
 NOT_ATTESTED = "NOT ATTESTED"
+# The recipe `canopus_tree.tree_state` stamps into its own state dict. Kept
+# here, beside ATTEST_RECIPE, and imported by canopus_tree.py rather than the
+# other way round, so the two modules cannot come to disagree about the name
+# without canopus_freeze's import tail growing a subprocess dependency it may
+# never carry.
+TREE_RECIPE = "canopus-tree-v1"
 
 
 def attest_state_path(root: Path) -> Path:
@@ -1638,6 +1645,8 @@ def build_attestation(
     baseline: Optional[dict] = None,
     process: Optional[dict] = None,
     plugin_baseline: Optional[Iterable[str]] = None,
+    tree_at_start: Optional[dict] = None,
+    tree_at_finish: Optional[dict] = None,
 ) -> dict:
     """Assemble the record written at session finish. Pure: no disk, no pytest.
 
@@ -1771,6 +1780,28 @@ def build_attestation(
                     f"xdist worker {index} loaded a different plugin set than the "
                     f"freeze recorded: {sorted(set(worker) ^ baseline_plugins)}"
                 )
+    if not _usable_tree_state(tree_at_finish) or not _usable_tree_state(tree_at_start):
+        # An attestation binds to the frozen bytes and to nothing else, and the
+        # code under test is by design NOT frozen. Without this, breaking the
+        # implementation and running nothing at all left `verify` reading
+        # ATTESTED: measured, on a scratch tree, before any of this was argued.
+        reasons.append(
+            "this run recorded no usable description of the tree it ran "
+            "against, so this record cannot perish when the code moves")
+    else:
+        drifted = tree_drift(tree_at_start, tree_at_finish)
+        for moved in drifted[:5]:
+            reasons.append(f"the tree changed while the run was in progress: {moved}")
+        if len(drifted) > 5:
+            # Five is a display bound, not a claim about how many there were --
+            # the same rule `_print_attestation` states for its own truncation
+            # of this list on the way out. Left silent, a caller that reads
+            # `reasons` directly (or a CLI whose own "(and N more)" is computed
+            # from this already-capped list) sees 5 of however many actually
+            # moved and has no way to know the difference.
+            reasons.append(
+                f"the tree changed while the run was in progress: "
+                f"(and {len(drifted) - 5} more, not named here)")
     if exit_status != 0:
         reasons.append(f"pytest exited {exit_status}")
 
@@ -1783,6 +1814,7 @@ def build_attestation(
         "attested_at": attested_at,
         "frozen_tests": {rel: dict(counts) for rel, counts in sorted(frozen_tests.items())},
         "process": process,
+        "tree": tree_at_finish if _usable_tree_state(tree_at_finish) else None,
     }
 
 
@@ -1840,21 +1872,99 @@ def write_attestation(root: Path, attestation: dict) -> None:
     atomic_write_text(path, json.dumps(attestation, indent=2, sort_keys=True) + "\n")
 
 
+# The two "this record does not even apply here" reasons `attestation_state`
+# returns, named rather than spelled inline. `canopus.py:_print_attestation`
+# reads this pair back to decide whether to print the tree's own half of the
+# story (see the branch's own comment there), and a SECOND spelling of either
+# string is a rename in one module away from that branch going permanently
+# silent -- measured as a live defect during the wire 3.2 scrutiny pass:
+# rewording the recipe reason here left the CLI's literal tuple stale and
+# nothing failed, because nothing compared the two. One constant, imported
+# where the second copy used to live, removes the class rather than adding a
+# test that only pins today's spelling.
+REASON_DIFFERENT_RECIPE = "the attestation was written by a different recipe"
+REASON_DIFFERENT_ROOT = "the attestation was recorded against a different root hash"
+
+
 def attestation_state(
-    attestation: Optional[dict], recomputed_root: str
+    attestation: Optional[dict], recomputed_root: str, current_tree
 ) -> Tuple[str, str]:
     """The second indicator axis, as (state, reason). Never raises.
 
-    Binding the record to the recomputed root is what makes it perishable: edit
-    any frozen file after a green run and the root moves, so the attestation
-    stops applying without anyone having to remember to delete it.
+    Two things make the record perishable, and they perish on different events.
+    The recomputed root covers the FROZEN bytes. The tree state covers
+    everything else in the working copy, which is where the code under test
+    lives. The second is the one that matters day to day: without it, a green
+    record survived breaking the implementation, and survived breaking it and
+    running nothing at all.
+
+    `current_tree` is required rather than defaulted. A default would let a
+    caller that forgot it skip the comparison and print green, which is the
+    fail-open shape this check exists to close.
     """
     if not isinstance(attestation, dict) or not attestation:
         return NOT_ATTESTED, "no run has attested this freeze yet"
     if attestation.get("recipe") != ATTEST_RECIPE:
-        return NOT_ATTESTED, "the attestation was written by a different recipe"
+        return NOT_ATTESTED, REASON_DIFFERENT_RECIPE
     if attestation.get("root") != recomputed_root:
-        return NOT_ATTESTED, "the attestation was recorded against a different root hash"
+        return NOT_ATTESTED, REASON_DIFFERENT_ROOT
     if not attestation.get("attested"):
         return NOT_ATTESTED, "the attesting run did not qualify"
+    drift = tree_drift(attestation.get("tree"), current_tree)
+    if drift:
+        tail = f" (and {len(drift) - 1} more)" if len(drift) > 1 else ""
+        return NOT_ATTESTED, f"{drift[0]}{tail}"
     return ATTESTED, ""
+
+
+def _usable_tree_state(candidate) -> bool:
+    """The shape every reader here assumes, checked once rather than four times."""
+    return (isinstance(candidate, dict)
+            and candidate.get("recipe") == TREE_RECIPE
+            and isinstance(candidate.get("head"), str)
+            and isinstance(candidate.get("dirty"), dict))
+
+
+def tree_drift(recorded, current) -> list[str]:
+    """Reasons the recorded tree state no longer describes the tree. Never raises.
+
+    A PURE comparison of two structures: this module runs no git and reads no
+    file, so its import tail stays stdlib plus `atomic`, which is what lets the
+    gate call it at every pytest session start.
+
+    Damage on either side is a reason rather than a pass, for the rule wire 3.1
+    settled over an empty claim set: not proved is not proved innocent.
+
+    Four kinds get four sentences. An operator who reads one string for all of
+    them cannot tell a new file from a deleted one from an edit from a commit.
+    """
+    if not _usable_tree_state(recorded):
+        return ["this run recorded no usable description of the tree it ran against"]
+    if not _usable_tree_state(current):
+        return ["the tree could not be described now, so the record cannot be checked"]
+    reasons: list[str] = []
+    if recorded["head"] != current["head"]:
+        reasons.append(
+            f"HEAD moved since the attesting run: {recorded['head']} to "
+            f"{current['head']}")
+    was, now = recorded["dirty"], current["dirty"]
+    # `_usable_tree_state` checks that `dirty` IS a dict, never that its keys
+    # are strings -- `tree_state` only ever writes string keys, but this
+    # function's contract is "never raises" over whatever a hostile or
+    # hand-edited record carries, and a bare `sorted()` raises TypeError the
+    # moment `was` and `now` disagree on key TYPE (str here, int there: Python
+    # orders neither against the other, nor anything against None). The key
+    # below sorts by (type name, repr) instead, both of which are defined for
+    # every Python value, so the ordering is TOTAL and the walk proceeds. That
+    # is the chosen half of the two options: let the comparison run rather than
+    # drop the offending key, because a dropped key is a path that stops being
+    # compared, which is the same silent-narrowing failure `dirty[rel] = None`
+    # above refuses for a deleted path.
+    for rel in sorted(set(was) | set(now), key=lambda rel: (type(rel).__name__, repr(rel))):
+        if rel not in now:
+            reasons.append(f"a path the attesting run saw is no longer reported: {rel}")
+        elif rel not in was:
+            reasons.append(f"a path appeared since the attesting run: {rel}")
+        elif was[rel] != now[rel]:
+            reasons.append(f"a path changed since the attesting run: {rel}")
+    return reasons
