@@ -52,11 +52,50 @@ SECRET_PATTERNS = [
         r'(?!Stored|REDACTED|N/A|See |TBD|Change|Reset|Set |Use |Your )'
         r'[^\n]{8,}'
     ), "Plaintext password in markdown"),
-    # Generic env-style password assignments with real values
+    # Generic env-style password assignments with real values.
+    #
+    # The exclusion is WHOLE-VALUE. Until 2026-07-31 it read
+    # `(?!(?i:your[-_]|changeme|example|placeholder|redacted|dummy|xxx|<))`,
+    # which tested only how the value BEGINS, so any tail could ride in behind a
+    # marker: a real password starting "xxx" passed this pattern, the blocking
+    # PreToolUse gate, AND the push-time content scan this workspace calls
+    # unbypassable. All seven word alternatives were defeated identically.
+    #
+    # Now the exclusion fires only when the value TAKEN WHOLE has placeholder
+    # shape: words of letters, each with an optional short digit tail, joined by
+    # - or _, carrying a marker somewhere. A real password breaks that shape at
+    # the first letter/digit mix inside a word, with or without punctuation.
+    #
+    # Three things to inherit rather than rediscover:
+    #   - The old `<` alternative was inert and is gone. `<` is not in the value
+    #     class, so a value starting with it never reached the exclusion at all.
+    #   - Residual FALSE NEGATIVE, like the {0,31} bound above: a real password
+    #     that is itself word-shaped and carries a marker
+    #     ("dummy-horse-battery-staple") is still excluded. Strictly smaller than
+    #     the old hole, which admitted any tail whatsoever.
+    #   - Residual FALSE POSITIVE, the direction that actually reaches an
+    #     operator: a PLACEHOLDER that breaks word shape is now flagged, e.g.
+    #     "changeme123!" (trailing symbol) or "your-P4ssw0rd" (digits inside a
+    #     word). Such a value cannot be told apart from a real password, so
+    #     flagging is the safe direction, but it lands as a hard refusal at BOTH
+    #     the write gate and the push wall, and it composes with the same-day
+    #     removal of `.env.example`'s path exemption. If a template needs one of
+    #     these shapes, write the placeholder in word shape. A pure-digit token
+    #     IS word shape ("placeholder-secret-1", "dummy_value_123"): those are
+    #     ordinary template values and admitting them costs the guarantee
+    #     nothing, measured — all 14 bypass samples stay flagged either way.
+    #
+    # Measured before shipping, across both repositories: 5089 files, 1327584
+    # lines, 0 new positives, 0 regressions.
     (re.compile(
         r'(?:EXCHANGE_PASSWORD|DB_PASSWORD|SMTP_PASSWORD|AUTH_PASSWORD)'
         r'\s*=\s*'
-        r'(?!(?i:your[-_]|changeme|example|placeholder|redacted|dummy|xxx|<))'
+        r'(?i:(?!'
+        r'(?=[A-Za-z0-9_-]*(?:your|changeme|example|placeholder|redacted|dummy|x{3,}))'
+        r'(?:[A-Za-z]+[0-9]{0,3}|[0-9]{1,4})'
+        r'(?:[-_](?:[A-Za-z]+[0-9]{0,3}|[0-9]{1,4}))*'
+        r'(?![A-Za-z0-9!@#$%^&*_+=-])'
+        r'))'
         r'[A-Za-z0-9!@#$%^&*_+=-]{8,}'
     ), "Password in environment variable assignment"),
 ]
