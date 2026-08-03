@@ -76,6 +76,17 @@ CAUSE_NO_ACTIVE_FREEZE = "no_active_freeze"
 CAUSE_EVIDENCE_MISSING = "evidence_missing"
 CAUSE_ATTESTATION_PERISHED = "attestation_perished"
 CAUSE_RETAKE_CAUSE_MISSING = "retake_cause_missing"
+# `repin` refusing because the enforcer bytes it would record are not committed.
+# The one refusal the manifest-split slice adds, and the reason that slice is not
+# a security trade: the cheap path still makes the change land in git.
+CAUSE_ENFORCER_UNCOMMITTED = "enforcer_uncommitted"
+# `repin` refusing because it could not ESTABLISH whether those bytes are
+# committed: the tree is inside a repository and git could not describe it.
+# A class of its own rather than a second reading of the one above, for the
+# reason this whole table exists — "two refusals of one kind count as two of one
+# thing" is false the moment one token covers two kinds. The cures differ too:
+# the first is `git commit`, this one is finding out why git is failing here.
+CAUSE_ENFORCER_UNVERIFIABLE = "enforcer_unverifiable"
 # The four that RAISE rather than return. Half the lifecycle's refusals never
 # reach a `return 1` -- an anchor that is not a file, a contract that is not red,
 # a damaged manifest -- and counting only the returns would have measured half
@@ -86,6 +97,8 @@ CAUSE_CONTRACT_ERROR = "contract_error"
 CAUSE_UNREADABLE = "unreadable"
 
 CAUSES = frozenset({
+    CAUSE_ENFORCER_UNCOMMITTED,
+    CAUSE_ENFORCER_UNVERIFIABLE,
     CAUSE_FREEZE_ALREADY_ACTIVE,
     CAUSE_ANCHOR_ALREADY_RECORDED,
     CAUSE_REPLACE_WITHOUT_REASON,
@@ -104,9 +117,12 @@ CAUSES = frozenset({
     CAUSE_UNREADABLE,
 })
 
-# The lifecycle gates. These three are the mechanisms whose refusals the ledger
-# now carries.
-MECHANISMS = ("approve", "freeze", "release")
+# The lifecycle gates: the mechanisms whose refusals the ledger now carries.
+# `repin` joined them with the manifest-split slice. Declared here for the same
+# reason DENIAL_MECHANISMS below is declared rather than discovered — a gate
+# missing from this tuple never appears in the report at all, which is
+# indistinguishable from a gate with nothing to say.
+MECHANISMS = ("approve", "freeze", "release", "repin")
 
 # The A1 guards that write to the denial log, by the names they pass. Declared
 # rather than discovered so a guard that has NEVER fired still appears in the
@@ -213,6 +229,11 @@ GATES = (
     "approve",
     "freeze",
     "release",
+    # A `repin` refusal is slice friction, exactly like the three above it: the
+    # enforcer bytes are uncommitted, or no lock is held. Declared here rather
+    # than left to the undeclared default, which would file it as a WALL and put
+    # a lifecycle gate into the set that is never judged by its catch count.
+    "repin",
     "depth-gate",
     "depth-gate:override",
     "check_canopus_freeze",
