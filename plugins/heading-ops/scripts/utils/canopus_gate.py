@@ -65,9 +65,19 @@ def loss_of_lock_sentences(report: dict, resolution: AnchorResolution) -> list[s
     sentence here and the enumeration is the thing a reader checks against
     `lock_state`.
 
-    Pure string work, and it never raises: the gate that calls it fails OPEN if
-    it does. The closing fallback covers a `lock_state` that reddens for a cause
-    this function does not know, which is exactly the drift the enumeration is
+    Pure string work, and it never raises ON A REPORT `verify_manifest` BUILT.
+    That is the whole of the claim, narrowed from "it never raises" after
+    `/scrutinize` measured the difference on 2026-08-04: four keys are read with
+    brackets, so a hand-built report missing one of them raises `KeyError` here,
+    and `freeze_gate` wraps that and fails closed while `cmd_status` would print
+    a traceback. Those four have been in the report since the first version and
+    have exactly one producer, so guarding them would be defensiveness against an
+    input that does not exist. `root_moved` is the one key an older producer can
+    genuinely lack, and it alone is read with a default. The wording is corrected
+    rather than the code, because the code is right and the sentence was not.
+
+    The closing fallback covers a `lock_state` that reddens for a cause this
+    function does not know, which is exactly the drift the enumeration is
     otherwise vulnerable to.
     """
     sentences: list[str] = []
@@ -86,8 +96,26 @@ def loss_of_lock_sentences(report: dict, resolution: AnchorResolution) -> list[s
     # sentences are said: the contract move is the graver of the two, and a
     # reader told about the cheap cure and not the expensive one would take the
     # cheap one and find the lock still red.
-    if not report["held"] and (report["changed"] or report["added"]
-                               or report["removed"] or not moved):
+    #
+    # `root_moved` leads the disjunction, and it is not decoration. This branch
+    # read the FILE LISTS alone, which is a different question from "did the
+    # contract move": the lists can be empty while the stored and recomputed
+    # roots disagree. Measured 2026-08-04 with a stored root the tree does not
+    # compute and one enforcer byte edited, the only sentence said was "The
+    # ENFORCER moved, not the contract", which was false of that tree and named
+    # the cheap cure — exactly the failure the paragraph above forbids, from the
+    # branch written to forbid it.
+    #
+    # The default is True, not False, and that is the whole of the guard. This
+    # function may not raise — the gate that calls it fails OPEN — so the key is
+    # read with a default; and a report that cannot say whether the root moved
+    # has not said that it did not. Defaulting False silently restores the exact
+    # defect above for any report shaped by an older producer. Defaulting True
+    # costs one extra sentence on an already-red lock.
+    root_moved = report.get("root_moved", True)
+    if not report["held"] and (root_moved or report["changed"]
+                               or report["added"] or report["removed"]
+                               or not moved):
         sentences.append("The frozen contract moved; run "
                          "`python scripts/canopus.py verify` for the per-file "
                          "report.")
