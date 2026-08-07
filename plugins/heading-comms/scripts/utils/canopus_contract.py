@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """Run a Canopus contract test set and read its shape from a JUnit report.
 
-Separate from scripts/utils/canopus_freeze.py, and the separation is the point:
-that module is imported by the PreToolUse dispatcher on every Write/Edit and is
-stdlib-only with no subprocess. This one runs pytest, so it can never be
-imported from there.
+This module runs pytest, so nothing loaded on a PreToolUse path may import it.
+That was the reason it was split out of the retired freeze primitive, and the
+constraint outlives the split.
 
-Two questions are answered here, both by running the contract once before it is
-frozen:
+Two questions are answered here, both by running the contract once:
 
   * How many items does each contract file yield when collected whole? That
-    number becomes the manifest baseline, and it is what closes the node-id
-    subset hole: `pytest file::test_one` then reports 1 against 7.
+    number is what closes the node-id subset hole: `pytest file::test_one`
+    reports 1 against 7.
   * Is the contract red? A test that is green before the implementation exists
-    asserts nothing, and freezing it would cement a contract that cannot fail.
+    asserts nothing, and approving it would cement a contract that cannot fail.
 """
 from __future__ import annotations
 
@@ -28,7 +26,6 @@ from pathlib import Path
 from typing import Optional, Sequence
 from xml.etree import ElementTree
 
-from scripts.utils.canopus_gate import pytest_child_env
 # The child's half of the handshake, imported rather than spelled again. Two
 # copies of an environment-variable name is a rename on one side away from a
 # child that claims nothing, two runs that agree on a red the rule never fires
@@ -55,6 +52,54 @@ from scripts.utils.venv import interpreter_identity, venv_python
 
 DEFAULT_PATTERNS = ("test_*.py",)
 RED_OUTCOMES = ("failure", "error")
+# The outcomes under a stub run that do NOT prove a test read the stubbed value.
+# `_outcome` emits exactly four tokens, so the complement of this set is the
+# single token "failure": a test is proved to assert something only by FAILING
+# under the stub, and passing, skipping or erroring all leave it unproved. Named
+# here rather than spelled inline in `run_null_stub` because the operator-facing
+# documents state this direction in prose, and
+# `tests/test_canopus_steps.py::test_the_documents_state_the_vacuity_direction_the_code_implements`
+# holds them to THIS tuple. Two definitions of the rule is how the prose inverted
+# itself against the code once already.
+UNPROVED_OUTCOMES = ("passed", "skipped", "error")
+
+
+def pytest_child_env(**overrides: str) -> dict:
+    """The environment for a pytest child this codebase launches: ours, minus PYTEST_.
+
+    Blanket prefix, never a denylist. PYTEST_ADDOPTS alone can load a plugin that
+    overrides pytest_pyfunc_call and makes every contract test report passed
+    without executing, and naming the variables you thought of leaves whichever
+    one you did not. The same shape as `canopus_check.git_child_env`, which does
+    this for GIT_.
+
+    ONE definition, because the two children it serves are COMPARED against each
+    other: `scripts/canopus_check.py` launches the per-file evidence run and this
+    module launches the contract run, and the check reads the first against the
+    contract the second measured. While only one child was scrubbed, the reading
+    was a photograph of the operator's shell. Measured on a scratch tree: a clean
+    shell captured
+
+        ['dist:_pytest', 'dist:anyio', 'dist:pytest_asyncio', 'dist:pytest_cov',
+         'dist:xdist']
+
+    and the same run with PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 exported captured
+    ['dist:_pytest'] alone.
+
+    It lives HERE, in the module that launches the contract child, rather than in
+    a module of its own: its previous home was the freeze gate, and that gate was
+    deleted with the rest of the lifecycle on 2026-08-07. A 14-line module named
+    after a gate that no longer exists is worse than the function sitting beside
+    its in-tree consumer.
+
+    The CANOPUS_ names are deliberately NOT scrubbed here. CANOPUS_NO_ATTEST is
+    how a caller tells a child what it is for, and it is passed in as an
+    *override* by the callers that need it.
+    """
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith("PYTEST_")}
+    env.update(overrides)
+    return env
 
 
 def contract_interpreter() -> Path:
@@ -172,6 +217,15 @@ def contract_files(
     the recorder never tallies. The engine pins `python_files = ["test_*.py"]` in
     pyproject.toml, so they agree today; *patterns* is the override if that ever
     stops being true.
+
+    A member that resolves OUTSIDE *root* is refused with a sentence naming the
+    root, never left to `relative_to`. Measured 2026-08-07: `canopus.py probe`
+    on an existing file outside the tree died with a raw
+    `ValueError: ... is not in the subpath of ...` traceback, because `main`
+    catches `ContractError` and `OSError` and this was neither. Its own stated
+    policy is that a filesystem fault produces a refusal the operator can act on
+    rather than a stack trace that reads as a bug in the tool, and a path
+    argument pointing somewhere else is the most ordinary way to reach it.
     """
     resolved_root = Path(root).resolve()
     found: set[str] = set()
@@ -183,7 +237,11 @@ def contract_files(
                 continue
             if not any(fnmatch(candidate.name, pattern) for pattern in patterns):
                 continue
-            found.add(candidate.resolve().relative_to(resolved_root).as_posix())
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(resolved_root):
+                raise ContractError(f"{resolved} is outside the tree being probed ({resolved_root}), so it is "
+                                    f"not part of that tree's contract. Pass --root to name the tree it is in.")
+            found.add(resolved.relative_to(resolved_root).as_posix())
     return sorted(found)
 
 
@@ -739,7 +797,6 @@ def run_pytest_report(
     timeout: int = 900,
     extra_env: Optional[dict] = None,
     extra_args: Sequence[str] = (),
-    plugin_dump: Optional[Path] = None,
     allowed_returncodes: Optional[Sequence[int]] = None,
 ) -> str:
     """Run pytest over *paths* once and return the raw JUnit XML.
@@ -795,19 +852,6 @@ def run_pytest_report(
     rule already forbids module-scope imports, but the diagnostic a builder reads
     when they break it should name the one file that broke, not the whole set.
 
-    `plugin_dump` is where the child writes the plugin set it loaded, and it is
-    the whole capture mechanism for the freeze-time plugin baseline: the child
-    is already a real pytest session running the contract, so the set comes from
-    the recorder that computes it anyway rather than from a second run or a
-    second describer. The caller owns the path because this function's own
-    scratch directory is gone by the time it returns.
-
-    Measured before it was relied on: `-o addopts=` above makes this child a
-    different topology from a gate run (no coverage, no `-n auto`), and the two
-    still load the same DISTRIBUTIONS. That is why one capture point serves
-    both, and it is also why the comparison is over distributions rather than
-    over raw plugin names.
-
     The return code is deliberately ignored BY DEFAULT. A contract that has not
     been implemented yet EXITS NONZERO, and that is the state this function
     exists to observe, so the baseline run reads its report whatever the child
@@ -847,24 +891,14 @@ def run_pytest_report(
         # measured symptom was `['__pycache__', 'test_one.py']` where only
         # test_one.py had been written.
         #
-        # The PYTEST_ scrub is the gate child's, taken from the one definition
-        # both share (canopus_gate.pytest_child_env). It is not tidiness either:
-        # this child CAPTURES the plugin baseline the gate child is later held
-        # to, so while it inherited the whole environment an exported
-        # PYTEST_DISABLE_PLUGIN_AUTOLOAD froze the operator's shell into the
-        # baseline and every later gate run refused. The measurement is in that
-        # function's docstring.
+        # The PYTEST_ scrub comes from the one definition every pytest child in
+        # this codebase shares (`pytest_child_env`, above). It is not tidiness:
+        # while this child inherited the whole environment, an exported
+        # PYTEST_DISABLE_PLUGIN_AUTOLOAD made the measurement a photograph of the
+        # operator's shell. The measurement is in that function's docstring.
         env = pytest_child_env(
             CANOPUS_NO_ATTEST="1", PYTHONDONTWRITEBYTECODE="1",
         )
-        if plugin_dump is not None:
-            env["CANOPUS_PLUGIN_DUMP"] = str(plugin_dump)
-        else:
-            # Never inherited. A dump path left in the environment by an outer
-            # freeze would have this child overwrite a capture it knows nothing
-            # about, and the null-stub run below is exactly such a child: its
-            # plugin set carries the stub plugin and is not the contract's.
-            env.pop("CANOPUS_PLUGIN_DUMP", None)
         if extra_env:
             env.update(extra_env)
         try:
@@ -936,34 +970,6 @@ def run_contract(
 ) -> tuple[dict[str, int], list[tuple[str, str, str]]]:
     """Run the contract once and read the report. See run_pytest_report."""
     return parse_junit(run_pytest_report(paths, root, timeout=timeout))
-
-
-def read_plugin_dump(path: Path) -> list[str]:
-    """The plugin identities the contract child recorded, or [] when it did not.
-
-    Empty is the fail-closed answer, not a shrug: a freeze that captures no
-    plugin baseline attests NOTHING afterwards, the same rule a freeze with no
-    test files already gets. The callers say so on the way past, because a
-    baseline that silently failed to capture would only announce itself much
-    later, as an attestation nobody can explain.
-
-    Damage is reported rather than raised for the same reason the attestation
-    reader treats damage as absence: this file is a measurement, and an
-    unreadable measurement is one that was not taken.
-    """
-    try:
-        data = json.loads(Path(path).read_bytes().decode("utf-8"))
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError) as exc:
-        print(f"canopus: the contract's plugin dump at {path} is unreadable: "
-              f"{exc}", file=sys.stderr)
-        return []
-    if not isinstance(data, list) or any(not isinstance(name, str) for name in data):
-        print(f"canopus: the contract's plugin dump at {path} is not a list of "
-              f"plugin names", file=sys.stderr)
-        return []
-    return sorted(set(data))
 
 
 def refusal_reasons(
@@ -1298,7 +1304,7 @@ def run_null_stub(
         # below is what keeps it visible rather than silent.
         unproved_each.append(
             {(rel, name) for rel, name, outcome in outcomes
-             if outcome in ("passed", "skipped", "error")}
+             if outcome in UNPROVED_OUTCOMES}
         )
     # An intersection is only evidence over one population. Two runs that
     # collected different tests were never compared, and two that collected
