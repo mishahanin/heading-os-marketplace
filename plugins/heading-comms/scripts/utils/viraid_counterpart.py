@@ -175,7 +175,7 @@ def build_vocab(root: Path) -> dict:
 
 def resolve(text: str, vocab: dict) -> dict:
     """Return {'external': [...], 'tribe': [...]} of counterpart tokens named in
-    text. Whole-word, case-insensitive; possessives ('Victor'') collapse to the
+    text. Whole-word, case-insensitive; possessives ('Morgan'') collapse to the
     bare token. Only structured-name vocab can match -- generic words cannot."""
     ext, trb = set(), set()
     for w in _WORD.findall((text or "").lower()):
