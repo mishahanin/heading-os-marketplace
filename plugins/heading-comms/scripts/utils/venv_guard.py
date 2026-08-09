@@ -12,7 +12,7 @@ Call it once, as early as practical, in a CLI entry point -- right after the
 standard sys.path bootstrap and before the heavy third-party imports:
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from scripts.utils.venv import ensure_venv  # noqa: E402
+    from scripts.utils.venv_guard import ensure_venv  # noqa: E402
     ensure_venv()
 
 os.execv replaces the whole process image, so it is correct even if some heavy
@@ -33,7 +33,7 @@ _SENTINEL = "HEADING_OS_VENV_RELAUNCHED"
 
 def venv_python() -> Path:
     """Path to the project venv interpreter (may not exist on this machine)."""
-    # scripts/utils/venv.py -> repo root is parents[2].
+    # scripts/utils/venv_guard.py -> repo root is parents[2].
     return Path(__file__).resolve().parents[2] / ".venv" / "bin" / "python"
 
 
