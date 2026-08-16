@@ -30,7 +30,7 @@ plugins, so that is where you install them from. Inside Claude Code:
 
 | Bundle | What it carries |
 | --- | --- |
-| `heading-core` | Sovereignty and session core: the prime/state-check/checkpoint skills plus the standalone sovereignty guard hooks. |
+| `heading-core` | Sovereignty and session core: the prime/state-check/checkpoint skills, the standalone sovereignty guard hooks, and the session checkpoint system - a context-usage sensor, a threshold offer with an optional hands-off auto mode, a redacted post-compact save, and a resume injector, all keyed by session so concurrent sessions never overwrite each other. |
 | `heading-intel` | Intelligence: parse a document with citations (docparse) and build a web-sourced market brief (market-brief). Reserved (need service creds): osint, x-pulse, yt-pulse, deep-research-advance, notebooklm. |
 | `heading-comms` | Communication: translate between English and Russian (translate). Reserved (need Exchange/Telegram/session or the send transport): email-intel, telegram, email-draft, email-respond, follow-up. |
 | `heading-content` | Content drafting: LinkedIn posts and series, plus image prompts (linkedin-post, linkedin-series, image-prompt). Reserved: flux-image (API key), linkedin-archive (private data). |
