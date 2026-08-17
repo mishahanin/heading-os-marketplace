@@ -3,11 +3,11 @@ name: checkpoint
 description: "Сохранить manual checkpoint текущей сессии в outputs/operations/handoff-archive/ без выполнения /compact. Используй когда хочешь зафиксировать состояние работы и иметь возможность вернуться позже с чистым контекстом. NEVER auto-trigger - вызывается ТОЛЬКО явной командой /checkpoint."
 allowed-tools: "Write, Read, Bash(date:*), Bash(python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py:*), Bash(python3 "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py:*)"
 disable-model-invocation: true
-argument-hint: "[заметка] | auto on | auto off | auto status"
+argument-hint: "[заметка] | auto on|off|status | unattended on|off|status"
 metadata:
   author: Misha Hanin
   email: misha.hanin@odinix.com
-  version: "1.2"
+  version: "1.3"
 x-heading-orchestration:
   parallel_safe: false
   shared_state: ["outputs/operations/handoff-archive/", ".claude/state/"]
@@ -31,7 +31,7 @@ x-heading-routing:
   category: Operations
   label: /checkpoint [note]
   triggers:
-    - NEVER auto-trigger. Explicit `/checkpoint [optional note]` only. Saves manual session handoff to `outputs/operations/handoff-archive/`, scoped to this session, without running /compact. Surfaces from the two-tier checkpoint-offer hook at the soft/hard thresholds (`CLAUDE_HANDOFF_SOFT_THRESHOLD` / `CLAUDE_HANDOFF_HARD_THRESHOLD`).
+    - NEVER auto-trigger. Explicit `/checkpoint [optional note]` only. Saves manual session handoff to `outputs/operations/handoff-archive/`, scoped to this session, without running /compact. Surfaces from the two-tier checkpoint-offer hook at the soft/hard thresholds (`CLAUDE_HANDOFF_SOFT_THRESHOLD` / `CLAUDE_HANDOFF_HARD_THRESHOLD`). Also carries two session switches, `auto on|off|status` for silent saves and `unattended on|off|status` to continue at a pause after a silent grace period instead of halting.
   exclusions:
     - Auto-resume after /compact handled by checkpoint-save.py (PostCompact)
     - reflective end-of-session -> /calibrate
@@ -68,9 +68,10 @@ hook could hand a resumed session another session's handoff.
 
 ## Procedure
 
-### Step 0 - Handle the `auto` argument first
+### Step 0 - Handle a switch argument first
 
-If `$ARGUMENTS` starts with `auto`, this is a switch and not a checkpoint.
+If `$ARGUMENTS` starts with `auto` or with `unattended`, this is a switch. It is
+not a checkpoint.
 
 Run one of these, then stop. Do not write any file.
 
@@ -78,15 +79,19 @@ Run one of these, then stop. Do not write any file.
 python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py --auto on
 python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py --auto off
 python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py --auto status
+python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py --unattended on
+python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py --unattended off
+python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py --unattended status
 ```
 
 Report the command output in one line. For `auto on`, continue to Step 1 and
 write the checkpoint as well. The operator asked at a threshold and expects this
-one on disk.
+one on disk. For `unattended on`, stop after the report. The operator is about to
+leave, so a question here defeats the switch.
 
-The switch applies to this session only. It overrides `CLAUDE_HANDOFF_AUTO` in
-both directions. It needs no cleanup. The state file carries a session key, and
-the pruner removes it with the session.
+Both switches apply to this session only. Each one overrides its own environment
+default in both directions. Neither needs cleanup. The state file carries a
+session key, and the pruner removes it with the session.
 
 ### Step 1 - Get this session's paths
 
@@ -96,9 +101,9 @@ One command prints all of them:
 python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py
 ```
 
-It emits `key=value` lines: `stamp`, `archive`, `summary_pointer`,
-`prompt_pointer`, `shared_summary_pointer`, `shared_prompt_pointer`,
-`session_id`. Archive paths are data-root-relative, which is the form the
+It emits `key=value` lines: `session_id`, `session_slug`, `stamp`,
+`project_root`, `data_root`, `archive`, `summary_pointer`, `prompt_pointer`,
+`shared_summary_pointer`, `shared_prompt_pointer`, `state`. Archive paths are data-root-relative, which is the form the
 `@`-reference resolves. Use them verbatim - never rebuild a path by hand, and
 never write into another session's pointer directory.
 
@@ -238,9 +243,11 @@ Do NOT continue implementation, do NOT call `/compact`, do NOT clear the session
 
 ## Auto mode
 
-Auto mode makes the Stop hook run this skill's procedure with no prompt at each
-threshold. The SessionStart hook then resumes the task by itself. Auto mode is
-OFF by default.
+Auto mode makes the Stop hook run this skill's procedure with no prompt. It
+fires once per 5% band, not at every pause, because the same hysteresis that
+governs the question governs the silent save. After a compaction, the
+SessionStart hook then tells the session to continue the unfinished task; that
+instruction is printed only when auto is on. Auto mode is OFF by default.
 
 Nothing here triggers compaction. A hook cannot start a compaction, so Claude
 Code's own auto-compact still decides when to free the context. Auto mode only
@@ -252,8 +259,11 @@ guarantees that the checkpoint lands first.
 python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py --auto on
 ```
 
-The threshold offer names this switch as an option, so you can choose it from
-the list. The choice belongs to the current window and dies with it.
+The threshold offer no longer gives this switch a numbered option. It names the
+switch only for the operator who stays at the keyboard, because `unattended`
+below is the better answer for the operator who leaves. Auto mode keeps one
+property that `unattended` gives up: it hands the turn back immediately, with no
+wait. The choice belongs to the current window and dies with it.
 
 **For the whole workspace,** set the environment default in
 `.claude/settings.local.json`:
@@ -269,6 +279,73 @@ the list. The choice belongs to the current window and dies with it.
 
 Keep the compaction percentage ABOVE the soft threshold. The checkpoint then
 always lands before compaction frees the context.
+
+## Unattended mode
+
+Unattended mode decides what happens when the session pauses and nobody answers.
+It is a SEPARATE switch from `auto`, and it is OFF by default.
+
+```bash
+python "${CLAUDE_PLUGIN_ROOT}"/scripts/checkpoint-paths.py --unattended on
+```
+
+The threshold offer names this switch as its second option, beside the plain
+checkpoint, so you can choose it from the list.
+
+Above the soft threshold, the Stop hook then waits instead of asking. Type
+anything inside the wait, and the turn goes back to you within one poll. Stay
+silent for the whole wait, and the hook tells the assistant to carry on.
+
+Use it for work that runs past the time you are at the keyboard: overnight, or
+across a weekend. It also turns `auto` on. Be exact about what that buys: the
+Stop hook in this mode writes no checkpoint at all. Auto is what makes the
+SessionStart hook tell the session to carry on after a compaction. The handoff itself is written by the PostCompact hook at each
+compaction, whatever either switch says. Turn unattended off, and `auto` goes
+back too, unless you chose `auto on` yourself.
+
+Nothing here triggers a compaction, and no hook can. The mode removes the reason
+a session halts, and Claude Code's own auto-compact then fires mid-work and
+carries on. That is why the mode is not named after compaction.
+
+Two bounds stop a run that goes nowhere. Each one catches a different failure.
+
+- The no-progress fuse compares a fingerprint of the committed head and of the
+  size and modification time of every file this session wrote. It reads only this
+  session's own files, so a sibling session or a daemon writing to the tree
+  cannot reset it. The third evaluation that moves neither stops the mode, so two
+  continuations happen before it fires, not three.
+- The ceiling stops the mode after 100 continuations in one window.
+
+**A stopped run is silent by design.** The hook records which of the two fuses
+stopped it, and the time it stopped, in the session state. It also sends one Telegram notice when you configured a target. Read
+that state with `--unattended status`.
+
+The mode stays quiet whenever something else already drives the Stop event.
+Three signals claim it. A scheduled `/loop` wakeup claims it. In-flight
+background work claims it. A ralph-loop that names this session claims it.
+
+`/goal` is the one case the mode cannot see. The harness holds that state in
+memory, so no hook reaches it. Claude Code limits the cost itself. After the
+goal's own hook blocks once, `stop_hook_active` suppresses this hook for the
+rest of the turn.
+
+Environment defaults, for the whole workspace rather than one session:
+
+```json
+"env": {
+  "CLAUDE_HANDOFF_UNATTENDED": "1",
+  "CLAUDE_HANDOFF_UNATTENDED_WAIT": "60",
+  "CLAUDE_HANDOFF_UNATTENDED_POLL": "2",
+  "CLAUDE_HANDOFF_UNATTENDED_STALL": "3",
+  "CLAUDE_HANDOFF_UNATTENDED_MAX": "100"
+}
+```
+
+**The wait is clamped at 75 seconds, whatever you set.** Claude Code discards the
+output of a hook that times out, so a wait at or above the registered timeout
+loses the continuation in silence. The shipped registration allows 90 seconds,
+and the clamp leaves room for the work that follows the wait. Raise the
+registration first if you need a longer grace period.
 
 ## NEVER
 

@@ -28,8 +28,10 @@ handoff nobody can regenerate.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
+import subprocess  # nosec B404 - fixed argv, never shell=True
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -217,6 +219,121 @@ def auto_mode(state: dict | None = None) -> bool:
     return env_bool("CLAUDE_HANDOFF_AUTO", False)
 
 
+def unattended_mode(state: dict | None = None) -> bool:
+    """Is this session allowed to continue on its own at a pause?
+
+    A SEPARATE switch from `auto_mode`, never a third value inside it, because
+    the two answer different questions: `auto` decides whether a checkpoint saves
+    without asking, this decides whether a pause hands the turn back to the
+    operator at all. Folding them together would put `auto_mode` in the path of
+    every later change to either, and `auto_mode` is what the statusline and both
+    older modes read.
+
+    Read from `session_unattended`. Same reason `auto_mode` reads
+    `session_auto`: the statusline rewrites its own echo keys every turn, so an
+    operator choice stored in one of those would survive about one turn.
+    """
+    if state:
+        flag = state.get("session_unattended")
+        if flag is not None:
+            return bool(flag)
+    return env_bool("CLAUDE_HANDOFF_UNATTENDED", False)
+
+
+# Claude Code DISCARDS the output of a hook that outruns its registered timeout.
+# A grace period at or above that timeout therefore loses the continuation in
+# silence: no block decision, no state write, no stall notice - and the operator
+# was told in writing that the session would carry on. The knob used to clamp at
+# 600, so `CLAUDE_HANDOFF_UNATTENDED_WAIT=120` was accepted and reported back as
+# "wait 120s, continue on silence" while the hook was being killed at 90. The
+# shipped Stop registration allows 90 seconds; 75 leaves room for the progress
+# fingerprint's git call and the state write that follow the wait.
+UNATTENDED_WAIT_MAX = 75
+
+
+# A task record carrying one of these is history, not work in flight.
+TERMINAL_TASK_STATES = frozenset({
+    "completed", "complete", "done", "finished", "failed", "error",
+    "cancelled", "canceled", "stopped", "killed", "timeout", "timed_out",
+})
+
+
+def wait_seconds() -> int:
+    """The grace period, clamped against the registered hook timeout."""
+    return env_int(
+        "CLAUDE_HANDOFF_UNATTENDED_WAIT", 60, minimum=1, maximum=UNATTENDED_WAIT_MAX
+    )
+
+
+def progress_fingerprint(project: Path, payload: dict | None = None) -> str:
+    """A digest of "has anything THIS SESSION does has moved", for the fuse.
+
+    Two inputs: the committed head, and the size-and-mtime of every file this
+    session wrote, per its own transcript. A continuation that moved neither did
+    nothing, whatever it said about itself.
+
+    Both halves of that are corrections. The first version hashed
+    `git status --short` and the COUNT of files written, and both were wrong in
+    opposite directions:
+
+    - `git status` reports that a file changed and never who changed it, so a
+      sibling session or a daemon writing one file between two pauses reset the
+      fuse. An overnight run with nothing left to do would then never stall - it
+      would run to the 100-continuation ceiling inventing work, which is the one
+      outcome the mode's own text calls unrecoverable. This is the defect
+      `.claude/rules/scope-claims.md` was written for, in the function that leans
+      on it hardest.
+    - the COUNT could not see the second edit of a file already written, because
+      `files_written()` returns a set. Real work confined to files already in it
+      read as three identical fingerprints and stopped the run for no progress.
+
+    Per-file size and mtime fixes the second; reading only this session's own
+    files fixes the first. One residual limit, named rather than hidden: a
+    SIBLING session's commit still moves HEAD and so still resets this fuse. HEAD
+    stays in because committing is the most common form of real progress that
+    touches no file mtime, and a sibling commit is a far narrower window than a
+    sibling write.
+
+    Deliberately NOT a timestamp and NOT a turn counter. Both advance whether or
+    not work happened, which is exactly the failure the fuse exists to catch.
+
+    Total: a tree without git, or an unreadable transcript, contributes an empty
+    component rather than raising. That degrades the fuse toward "everything
+    looks unchanged", which stops an unattended run early. Stopping early is the
+    safe direction here; continuing blind is not.
+    """
+    payload = payload or {}
+    parts: list[str] = []
+    try:
+        proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(project),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        parts.append(proc.stdout.strip() if proc.returncode == 0 else "")
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        print(f"checkpoint: git rev-parse unavailable: {exc}", file=sys.stderr)
+        parts.append("")
+
+    try:
+        from scripts.utils.session_scope import files_written
+
+        mine = files_written(payload.get("transcript_path"))
+        for path in sorted(mine or []):
+            try:
+                stat = path.stat()
+                parts.append(f"{path}:{stat.st_size}:{stat.st_mtime_ns}")
+            except OSError:
+                parts.append(f"{path}:gone")
+    except Exception as exc:  # noqa: BLE001 - a missing component, not a failure
+        print(f"checkpoint: written-file scan unavailable: {exc}", file=sys.stderr)
+
+    joined = "\x00".join(parts)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
 def config(state: dict | None = None) -> dict:
     """Thresholds and mode.
 
@@ -235,6 +352,91 @@ def config(state: dict | None = None) -> dict:
         "step": env_int("CLAUDE_HANDOFF_REMIND_STEP", 5, minimum=1),
         "auto": auto_mode(state),
     }
+
+
+def _ralph_owner(project: Path) -> str | None:
+    """The session id written in the ralph-loop plugin's state file.
+
+    None means nothing claims the loop here. An EMPTY string means the file
+    exists without a `session_id:` line, and that is not the same answer: the
+    plugin's own hook falls through in that case and drives the loop for
+    whichever session reaches the Stop event, so a missing id claims every
+    session on the tree rather than none of them.
+
+    Presence of the file is taken as a LIVE loop rather than as evidence one ran
+    once, because the plugin removes it on every terminal path it has: the
+    completion promise detected, the iteration ceiling reached, and a state file
+    it cannot parse. Read off `hooks/stop-hook.sh` in the installed plugin on
+    2026-08-17 rather than assumed.
+    """
+    path = project / ".claude" / "ralph-loop.local.md"
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = raw.splitlines()
+    if not lines or lines[0].strip() != "---":
+        # Not the plugin's shape. Its own hook cannot read an iteration out of
+        # this either, and deletes the file when it tries, so claim nothing.
+        return None
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if stripped.startswith("session_id:"):
+            return stripped.split(":", 1)[1].strip()
+    return ""
+
+
+def continuation_claimant(
+    payload: dict | None = None, project: Path | None = None
+) -> str:
+    """The name of whatever already drives this Stop event, or "" if nothing does.
+
+    A Stop event can carry more than one hook, and a second voice on an event
+    something else is already driving costs that driver a turn: the offer's
+    question is answered by a model instead of by the operator who is not there
+    to read it. So the offer stays quiet whenever any of three signals fires.
+
+    Two of the three are Claude Code's own payload fields, not heuristics.
+    `session_crons` carries the tasks that will wake the session later, which is
+    what `/loop`, `CronCreate` and `ScheduleWakeup` register. `background_tasks`
+    carries in-flight work, and its own description draws exactly the
+    distinction that matters here, between a finished session and one paused
+    waiting to be woken. The third is the ralph-loop plugin's state file.
+
+    **`/goal` is NOT among them, and cannot be.** It is itself a Stop hook of
+    type `prompt` registered into the session, and its state lives in the
+    harness's memory: it reaches neither the disk nor this payload, so no hook
+    written in Python can see it. What limits the damage is the harness rather
+    than anything here. Once the goal's own hook blocks a turn,
+    `stop_hook_active` is true for the remainder of that turn and the caller
+    bails on it, so the offer can reach a goal run at most once per operator
+    turn, and a blocked offer does not end the run.
+    """
+    payload = payload or {}
+    for field in ("session_crons", "background_tasks"):
+        value = payload.get(field)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            # A record that says it is finished does not claim anything. Reading
+            # mere list non-emptiness meant one completed background task could
+            # silence the checkpoint system for the rest of the session - every
+            # threshold offer suppressed, unattended mode never engaging, and the
+            # only trace a key in a state file nobody reads. An entry with no
+            # status, or a status this does not recognise, still claims: unknown
+            # resolves toward staying out of the way.
+            if isinstance(item, dict):
+                status = str(item.get("status") or "").strip().lower()
+                if status in TERMINAL_TASK_STATES:
+                    continue
+            return field
+    if project is not None:
+        owner = _ralph_owner(project)
+        if owner is not None and owner in ("", session_id(payload)):
+            return "ralph-loop"
+    return ""
 
 
 def compact_point() -> tuple[str, str] | None:
