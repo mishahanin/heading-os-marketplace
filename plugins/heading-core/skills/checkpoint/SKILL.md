@@ -2,6 +2,7 @@
 name: checkpoint
 description: "Сохранить manual checkpoint текущей сессии в outputs/operations/handoff-archive/ без выполнения /compact. Используй когда хочешь зафиксировать состояние работы и иметь возможность вернуться позже с чистым контекстом. NEVER auto-trigger - вызывается ТОЛЬКО явной командой /checkpoint."
 allowed-tools: "Write, Read, Bash(date:*), Bash(python \"${CLAUDE_PLUGIN_ROOT}\"/scripts/checkpoint-paths.py:*), Bash(python3 \"${CLAUDE_PLUGIN_ROOT}\"/scripts/checkpoint-paths.py:*)"
+disable-model-invocation: true
 argument-hint: "[заметка] | auto on|off|status | unattended on|off|status | compact-at N|status|off"
 metadata:
   author: Misha Hanin
@@ -48,9 +49,9 @@ Save a manual session checkpoint without running `/compact` or clearing context.
 ## What this does
 
 - Writes ONE combined handoff file to `outputs/operations/handoff-archive/`
-- Updates FOUR pointer files: this session's pair under
+- Updates FOUR pointer files. This session's pair sits under
   `.latest/{session-slug}/{summary.md,prompt.md}`, which the SessionStart inject
-  hook reads, and the shared pair at `.latest/{summary.md,prompt.md}`, which
+  hook reads. The shared pair sits at `.latest/{summary.md,prompt.md}`, which
   `/next` reads as "the newest handoff in this workspace"
 - Does NOT run `/compact`
 - Does NOT clear the session

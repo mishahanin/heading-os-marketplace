@@ -111,6 +111,25 @@ def get_model(provider: str) -> str:
     return FALLBACKS[provider]
 
 
+def is_fallback(provider: str) -> bool:
+    """True when this provider resolved to the baseline, not to a pin.
+
+    `council-models.py --show` used to infer this from `config_path().exists()`,
+    which answers a different question: whether the FILE is there, not whether
+    it names THIS provider. A config holding only `{"grok": ...}` — a partial
+    file, a hand edit, one written by an older version — made gemini and kimi
+    resolve to FALLBACKS and print with no `(fallback)` marker at all, so the
+    operator read a baseline as a deliberate pin. Resolution is per provider,
+    so the question has to be asked per provider.
+    """
+    if provider not in FALLBACKS:
+        raise ValueError(
+            f"Unknown council provider: {provider!r}. Known: {', '.join(PROVIDERS)}"
+        )
+    value = _load_config().get(provider)
+    return not (isinstance(value, str) and value.strip())
+
+
 def load_all() -> dict:
     """Resolved {provider: model} for every known provider."""
     return {provider: get_model(provider) for provider in PROVIDERS}
@@ -119,8 +138,16 @@ def load_all() -> dict:
 def set_model(provider: str, model: str) -> None:
     """Set one provider's pin in config/council-models.json (atomic write).
 
-    Preserves any other keys already in the file. Raises ValueError on an
-    unknown provider or an empty model string.
+    Preserves any other keys already in the file, and REFUSES rather than
+    rewrite when it cannot read them. `_load_config()` returns `{}` for a
+    malformed file, which is right for a reader falling back to the baseline and
+    wrong for a writer: bumping one pin against a hand-broken config rebuilt the
+    file from that `{}` and erased every other operator-chosen pin, silently
+    reverting them to fallbacks. The read-side warning went to stderr and the
+    write still happened.
+
+    Raises ValueError on an unknown provider or an empty model string, and
+    RuntimeError when the existing config is present but unreadable.
     """
     if provider not in FALLBACKS:
         raise ValueError(
@@ -130,7 +157,25 @@ def set_model(provider: str, model: str) -> None:
         raise ValueError("Model id must be a non-empty string.")
 
     path = config_path()
-    data = _load_config()
+    if path.exists():
+        # Read it here rather than through `_load_config`, whose `{}` cannot be
+        # told apart from an empty file. A writer needs that difference.
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            raise RuntimeError(
+                f"refusing to rewrite {path}: it exists but cannot be read "
+                f"({e}). Writing would drop every pin already in it. Fix or "
+                f"delete the file, then set the pin again."
+            ) from e
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"refusing to rewrite {path}: it holds a "
+                f"{type(data).__name__}, not an object of pins."
+            )
+    else:
+        data = {}
     data[provider] = model.strip()
 
     path.parent.mkdir(parents=True, exist_ok=True)

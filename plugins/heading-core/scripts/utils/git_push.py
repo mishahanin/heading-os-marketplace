@@ -82,20 +82,67 @@ _GITHUB_HOST_ALIASES = {
 _VIS_CACHE: dict[tuple[str, bool], Optional[str]] = {}
 
 
-def _is_split_engine(repo: Path) -> bool:
-    """True iff ``repo`` is the split-topology ENGINE clone (data lives in a sibling).
+# The one file that only the engine clone carries. `CLAUDE.md` and `.claude/` are
+# not enough: the data overlay has `.claude/` too.
+_ENGINE_MARKER = Path("scripts") / "utils" / "engine_guard.py"
 
-    Only the engine must stay code-only. The DATA overlay and the corporate/CRM repos
-    legitimately carry private/corporate content, so they are exempt. Detected from the
-    data-root seam: engine == workspace root AND data root resolves elsewhere. On a
-    pre-cutover single repo (data root == workspace root) nothing is walled here.
+
+def _is_split_engine(repo: Path) -> bool:
+    """True iff ``repo`` is the ENGINE clone and must therefore stay code-only.
+
+    Only the engine is walled. The DATA overlay and the corporate/CRM repos
+    legitimately carry private/corporate content, so they are exempt, and they are
+    identified by not being the workspace root.
+
+    The second test used to be "the data root resolves somewhere else", exempting a
+    repository whose data root collapsed onto itself. That is an inversion, because
+    of HOW the collapse happens: `get_data_root()` rule 2 returns the workspace root
+    when it finds `crm/contacts/` or `knowledge/` INSIDE it. Private data appearing
+    in the engine clone is the single condition this wall exists to catch, and it
+    was the condition that switched the wall off. Reproduced on 2026-08-25 against a
+    scratch engine clone holding `knowledge/note.md` and `outputs/deal.md`:
+    `_is_split_engine` answered False, `_roots_unreadable` answered None, the wall
+    never ran, and `scan_engine_repo` - had it been called - flagged all four
+    artifacts. `get_data_root` logs a warning there, to a logger no one is reading
+    at push time.
+
+    So a collapsed data root no longer exempts anything. The engine marker decides
+    instead, and the wall then REFUSES only if the scan actually finds something -
+    the same direction `_roots_unreadable` already takes for an unreadable
+    environment. A clean engine clone still pushes.
     """
     try:
         engine = get_workspace_root().resolve()
         data = get_data_root().resolve()
     except Exception:
         return False
-    return data != engine and repo.resolve() == engine
+    resolved = repo.resolve()
+    if resolved != engine:
+        return False
+    if data != engine:
+        return True
+    return (resolved / _ENGINE_MARKER).is_file()
+
+
+def _roots_unreadable(repo: Path) -> str | None:
+    """Why the workspace roots could not be resolved, when `repo` is the engine.
+
+    None means "no problem here": either the roots resolved, or this repository
+    is not the engine clone and was never walled.
+
+    This exists because `_is_split_engine` answers False on an unreadable
+    environment, and False means "exempt". So the leak wall stopped running in
+    exactly the broken state where misrouting is most likely, and said nothing -
+    found by the 2026-08-23 audit. The remote-check leg already warned loudly for
+    the same condition; the tree wall did not.
+    """
+    try:
+        get_workspace_root().resolve()
+        get_data_root().resolve()
+    except Exception as exc:
+        if (Path(repo) / _ENGINE_MARKER).is_file():
+            return str(exc)
+    return None
 
 
 def _normalize_remote_url(url: str) -> str:
@@ -366,10 +413,10 @@ def load_gh_token() -> Optional[str]:
     except (OSError, UnicodeDecodeError) as exc:
         # A wall built to fail open must not carry a hard-crash path. This
         # function's own token expression is evaluated eagerly by every
-        # `supervised_push` caller, including `promote-corporate`,
-        # `rollback-corporate`, `offboard-exec` and `create-data-repo`, none of
-        # which used to reach this read, and Check A never uses the token
-        # anyway, so a single non-UTF-8 byte in `.env` must not crash all four.
+        # `supervised_push` caller, including `offboard-exec` and
+        # `create-data-repo`, none of which used to reach this read, and Check A
+        # never uses the token anyway, so a single non-UTF-8 byte in `.env` must
+        # not crash them.
         logger.debug("gh token unreadable: %s", exc)
         return None
     return None
@@ -432,6 +479,23 @@ def supervised_push(
     # routed file in the engine clone can never leave the machine, on any path, with no
     # skip flag. Runs BEFORE the push subprocess (refuse, do not push-then-detect).
     # The DATA/corporate/CRM repos are exempt (they legitimately carry such files).
+    # Refuse rather than skip when the roots are unreadable and this IS the engine
+    # clone: an unbypassable wall that quietly stops scanning is not a wall.
+    unreadable = _roots_unreadable(repo)
+    if unreadable:
+        return {
+            "state": "failed",
+            "reason": (
+                f"cannot resolve the workspace roots, so the engine/data leak wall "
+                f"could not run on this engine clone; refusing to push. Reason: "
+                f"{unreadable}"
+            ),
+            "elapsed_s": 0.0,
+            "exit_code": None,
+            "tail": "",
+            "flagged": [],
+        }
+
     if _is_split_engine(repo):
         flagged = scan_engine_repo(repo)
         if flagged:

@@ -51,6 +51,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from scripts.utils.atomic import atomic_write_text  # noqa: E402
 from scripts.utils.workspace import get_workspace_root  # noqa: E402
 
 # ============================================================
@@ -144,6 +145,16 @@ def load_profiles(path: Path | None = None) -> tuple[dict, str | None]:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         return dict(_SAFE_PROFILES), f"profile config unreadable ({exc}); falling back to screen (suppresses nothing)"
+
+    # Valid JSON is not a valid config. A file holding a list, a string or a
+    # number parses cleanly and then raises AttributeError on `.get` one line
+    # down, which is the loud crash this docstring promises never to produce -
+    # and worse, it is a crash rather than the noisier-not-quieter fallback.
+    if not isinstance(loaded, dict):
+        return dict(_SAFE_PROFILES), (
+            "profile config is not a JSON object; falling back to screen "
+            "(suppresses nothing)"
+        )
 
     if not isinstance(loaded.get("profiles"), dict) or "screen" not in loaded.get("profiles", {}):
         return dict(_SAFE_PROFILES), "profile config has no `screen` profile; falling back to screen (suppresses nothing)"
@@ -382,7 +393,14 @@ def relative_path(file_path: str | Path) -> str:
     root = str(get_workspace_root()).replace("\\", "/").rstrip("/") + "/"
     if text.startswith(root):
         text = text[len(root):]
-    return text.lstrip("./")
+    # `removeprefix`, not `lstrip`. `lstrip` takes a CHARACTER SET, so it also ate
+    # the leading dot of every top-level dot-directory: `.git/x.html` came back as
+    # `git/x.html` and `.claude/hooks/a.html` as `claude/hooks/a.html`. Two costs.
+    # The `/.git/` fragment in `config/visual-check-profiles.json` could then never
+    # appear in `rel`, so that out-of-scope rule was dead; and the mangled string
+    # is what lands in report lines and in `.visual-baseline.json` keys, so the
+    # detail command the report prints named a path that does not resolve.
+    return text.removeprefix("./")
 
 
 def load_baseline(path: Path | None = None) -> dict:
@@ -422,7 +440,11 @@ def record_baseline(findings: list[dict], path: Path | None = None) -> dict:
         ),
         "files": ordered,
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    # Atomic, per the workspace rule for persistent state. A plain `write_text`
+    # truncates first, so an interrupt or a full disk mid-write leaves a partial
+    # JSON file - and `load_baseline` reads an unparseable baseline as an EMPTY
+    # freeze, which silently un-suppresses every frozen finding on the next run.
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=False) + "\n")
     return ordered
 
 
@@ -472,9 +494,16 @@ def report_for_artifact(path, profile: str | None = None, stream=None) -> int:
         print(f"[design] check unavailable ({exc})", file=stream)
         return 0
 
+    # The note is a WARNING, not a verdict. `deep_findings` returns it alongside
+    # findings it has already computed - `load_profiles` emits one for a missing
+    # or malformed `config/visual-check-profiles.json` and then falls back to the
+    # `screen` profile, which suppresses nothing. Returning 0 here threw those
+    # findings away and printed only the warning, so a config typo silenced every
+    # design finding on every freshly rendered artifact, in a module whose
+    # docstring says "every failure path here degrades toward reporting MORE,
+    # never toward silence". Say the note, then report what was found anyway.
     if note:
         print(f"[design] {note}", file=stream)
-        return 0
 
     if not findings:
         print(f"[design] clean - no deep design findings ({profile or 'auto'} profile).", file=stream)

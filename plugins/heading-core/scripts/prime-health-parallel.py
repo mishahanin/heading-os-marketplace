@@ -3,9 +3,11 @@
 
 Replaces the previous serial chain of subprocess invocations the /prime skill
 executed. The checks are defined in the CHECKS registry and rendered in
-DISPLAY_ORDER (crm-health, knowledge-health, memory file scan, email-intel
-state read, thread.py archive-scan, fireside-pulse, sync-exchange health, and
-the read-only odin-cadence nudge). Each runs in its own thread via
+DISPLAY_ORDER -- see those two objects below for the live set, which is the
+only place it is stated. This sentence used to enumerate eight checks by name
+while the registry held twelve; four (ops_radar, reminders_due, dream_shadow,
+updates) had been added and never written down, which is how a check gets
+added in one place and missed in another. Each runs in its own thread via
 concurrent.futures.ThreadPoolExecutor(max_workers=8). Output blocks are emitted
 in the same fixed order /prime expects so the CEO-facing brief stays unchanged.
 
@@ -148,7 +150,7 @@ def run_memory_health(workspace_root: Path) -> dict[str, Any]:
                 break
     # Objective defect computation is shared with scripts/memory-hygiene.py via
     # scripts/utils/memory_health.compute_memory_defects (dir-parameterized).
-    from scripts.utils.memory_health import compute_memory_defects
+    from scripts.utils.memory_health import MEMORY_BUDGET_LINES, compute_memory_defects
 
     data = compute_memory_defects(memory_dir)
     if data["status"] == "missing":
@@ -163,24 +165,37 @@ def run_memory_health(workspace_root: Path) -> dict[str, Any]:
     orphans = data["orphans"]
 
     issues = []
+    # `compute_memory_defects` has always returned this flag and this panel has
+    # always dropped it, so an index over its own printed budget was reported as
+    # "All healthy" - with the number that refutes the claim sitting in the same
+    # sentence, two words to its left. `scripts/memory-hygiene.py` reads the same
+    # field from the same helper and counts it as a defect in five places; the
+    # panel the operator sees at EVERY session start was the honest tool's silent
+    # twin.
+    if data.get("over_budget"):
+        issues.append(f"MEMORY.md is over its {MEMORY_BUDGET_LINES}-line budget")
     if stale:
         issues.append(f"{len(stale)} memory files >45 days old (review recommended)")
+    # The index state comes first, because it explains the orphan count rather
+    # than adding to it: an absent MEMORY.md makes every fact file unreferenced.
+    if not data.get("index_readable", True):
+        issues.append(f"MEMORY.md was NOT read ({data.get('index_problem')})")
     if orphans:
         issues.append(f"{len(orphans)} orphan file(s) not linked from MEMORY.md")
 
-    if issues:
-        body = (
-            f"Memory: {files_count} files, {lines}/200 lines. Issues: "
-            + "; ".join(issues)
-        )
-    else:
-        body = f"Memory: {files_count} files, {lines}/200 lines. All healthy."
+    # The budget in the printed line is the constant the flag above is computed
+    # from, not a literal beside it. A hardcoded `/200` here would keep printing
+    # 200 after someone moved the budget, which is how the number and the verdict
+    # came apart in the first place.
+    counts = f"Memory: {files_count} files, {lines}/{MEMORY_BUDGET_LINES} lines."
+    body = counts + (" Issues: " + "; ".join(issues) if issues else " All healthy.")
 
     return {
         "status": "ok",
         "output": body,
         "file_count": files_count,
         "memory_md_lines": lines,
+        "over_budget": bool(data.get("over_budget")),
         "stale": stale,
         "orphans": orphans,
     }
@@ -234,14 +249,20 @@ def run_email_intel_status(workspace_root: Path) -> dict[str, Any]:
     # Check pending P1 tasks
     tasks_path = state_path.parent / "tasks.md"
     p1_open = 0
+    tasks_note = ""
     if tasks_path.exists():
         try:
             for line in tasks_path.read_text(encoding="utf-8", errors="ignore").splitlines():
                 stripped = line.strip()
                 if stripped.startswith("- [ ]") and "P1" in stripped:
                     p1_open += 1
-        except OSError:
-            pass
+        except OSError as exc:
+            # UNKNOWN is not ZERO. A bare `pass` here reported `p1_open = 0`,
+            # so an unreadable tasks.md told the operator there were no pending
+            # P1 tasks when the count was simply not available -- a silent
+            # failure on a priority signal.
+            tasks_note = f" tasks.md unreadable ({exc}); P1 count UNKNOWN."
+            p1_open = None
 
     if hours_ago > 20:
         body = (
@@ -253,9 +274,11 @@ def run_email_intel_status(workspace_root: Path) -> dict[str, Any]:
 
     if p1_open:
         body += f" Pending P1 tasks: {p1_open}."
+    body += tasks_note
 
     return {
-        "status": "ok",
+        # An unreadable tasks.md is a partial answer, not an ok one.
+        "status": "ok" if p1_open is not None else "error",
         "output": body,
         "last_run_hours_ago": hours_ago,
         "p1_open": p1_open,
@@ -317,7 +340,9 @@ def run_fireside_health(workspace_root: Path) -> dict[str, Any]:
         text=True,
         timeout=CHECK_TIMEOUT,
     )
-    return {"status": "ok" if proc.returncode == 0 else "failed",
+    # "error", not "failed": one failure word across every check, so the
+    # renderer and the checks cannot disagree about which one means trouble.
+    return {"status": "ok" if proc.returncode == 0 else "error",
             "output": proc.stdout or proc.stderr or "(no output)"}
 
 
@@ -333,7 +358,9 @@ def run_sync_exchange_health(workspace_root: Path) -> dict[str, Any]:
         text=True,
         timeout=CHECK_TIMEOUT,
     )
-    return {"status": "ok" if proc.returncode == 0 else "failed",
+    # "error", not "failed": one failure word across every check, so the
+    # renderer and the checks cannot disagree about which one means trouble.
+    return {"status": "ok" if proc.returncode == 0 else "error",
             "output": proc.stdout or proc.stderr or "(no output)"}
 
 
@@ -357,8 +384,27 @@ def run_odin_cadence(workspace_root: Path) -> dict[str, Any]:
         text=True,
         timeout=CHECK_TIMEOUT,
     )
+    if proc.returncode != 0:
+        # A non-zero child exit with EMPTY stdout used to vanish completely.
+        # `render_text` honours `omit_if_empty` BEFORE it ever consults
+        # `status`, so the banner, the failure and the captured stderr were all
+        # dropped, and session boot rendered a clean brief over a check that had
+        # crashed. odin-cadence.py only ever `return 0`s, so a non-zero exit is
+        # an uncaught exception: the traceback goes to stderr and stdout is
+        # empty, which is exactly the shape that disappeared.
+        #
+        # The repo's own precedent is a non-empty `output` plus
+        # `omit_if_empty: False` on the error path (run_dream_shadow,
+        # run_reminders_due, run_updates); the same shape is already pinned for
+        # dream_shadow by tests/test_a_scan_that_never_ran_reported_nothing_to_do.py.
+        return {
+            "status": "error",
+            "output": f"odin-cadence.py exited {proc.returncode}",
+            "stderr": proc.stderr.strip(),
+            "omit_if_empty": False,
+        }
     return {
-        "status": "ok" if proc.returncode == 0 else "error",
+        "status": "ok",
         "output": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
         "omit_if_empty": True,
@@ -385,12 +431,31 @@ def run_ops_radar(workspace_root: Path) -> dict[str, Any]:
         text=True,
         timeout=CHECK_TIMEOUT,
     )
+    if proc.returncode != 0:
+        # Same shape as run_odin_cadence above, for the same reason: a crashed
+        # child writes its traceback to stderr and leaves stdout empty, and
+        # `omit_if_empty` then erased the whole section before `render_text`
+        # looked at the status.
+        return {
+            "status": "error",
+            "output": f"ops-radar.py exited {proc.returncode}",
+            "stderr": proc.stderr.strip(),
+            "omit_if_empty": False,
+        }
     out = proc.stdout.strip()
     # "all clear" -> omit the panel; only surface when something is actually due.
-    if "all clear" in out:
+    #
+    # Tested on the FIRST LINE, not anywhere in the output. `"all clear" in out`
+    # searched every line of the detailed view, so a single due item whose
+    # summary carried that phrase blanked the entire panel -- the brief then said
+    # nothing at all while something was in fact due. render_detailed emits the
+    # all-clear sentence as the whole output, and any other run opens with
+    # "ops-radar: N item(s) due".
+    first_line = out.splitlines()[0] if out else ""
+    if first_line.endswith("all clear - nothing due."):
         out = ""
     return {
-        "status": "ok" if proc.returncode == 0 else "error",
+        "status": "ok",
         "output": out,
         "stderr": proc.stderr.strip(),
         "omit_if_empty": True,
@@ -460,10 +525,30 @@ def run_dream_shadow(workspace_root: Path) -> dict[str, Any]:
     # read when they want it. Merge candidates DO need a nudge — each one is a
     # decision waiting on them.
     merge_section = re.search(r"## Merge Candidates.*?\n\n(.*?)(?:\n---|\Z)", text, re.DOTALL)
-    merge_n = 0
-    if merge_section:
-        merge_n = len(re.findall(r"^- .+<->.+$", merge_section.group(1), re.MULTILINE))
+    body = merge_section.group(1) if merge_section else ""
 
+    # A scan that COULD NOT RUN is not a scan that found nothing. When the
+    # embedder is unavailable, dream-shadow writes one `- UNAVAILABLE: ...`
+    # bullet instead of pair lines; it carries no `<->`, so the count below read
+    # 0 and this check returned `status: ok` with empty output and
+    # `omit_if_empty`. The embedder could be down every night and session boot
+    # would never say a word. Surfaced by its marker, not by a count.
+    #
+    # What makes this render is `omit_if_empty: False` plus a non-empty output,
+    # NOT the status string: `render_text` only consults the status to decide
+    # whether to append stderr. So adding "warn" to NON_FAILURE_STATUSES later
+    # cannot silently re-hide this line.
+    unavailable = re.search(r"^- UNAVAILABLE: *(.*)$", body, re.MULTILINE)
+    if unavailable:
+        return {
+            "status": "warn",
+            "output": (f"Dream-shadow: merge scan did not run "
+                       f"({unavailable.group(1).strip() or 'no reason recorded'}) — "
+                       f"consolidation is not being detected."),
+            "omit_if_empty": False,
+        }
+
+    merge_n = len(re.findall(r"^- .+<->.+$", body, re.MULTILINE))
     if merge_n == 0:
         return {"status": "ok", "output": "", "omit_if_empty": True}
     return {
@@ -492,20 +577,34 @@ def run_updates(workspace_root: Path) -> dict[str, Any]:
                 "omit_if_empty": True}
 
     lines: list[str] = []
+    # `.get` with a fallback on every field. The state file is written by a
+    # DIFFERENT component (update-manager), so any version skew between writer
+    # and reader used to turn one entry missing one of four keys into a KeyError
+    # that took the whole updates section down -- hiding every other valid
+    # update behind a traceback. The statuses below are update-manager's
+    # vocabulary, not this script's check statuses; they are unrelated words
+    # that happen to look alike.
     for name, e in state.get("components", {}).items():
+        if not isinstance(e, dict):
+            lines.append(f"{name}: malformed entry ({type(e).__name__}), skipped")
+            continue
+        display = e.get("display", name)
+        current = e.get("current", "?")
+        latest = e.get("latest", "?")
+        tier = e.get("tier", "?")
         status = e.get("status")
         if status == "waiting":
             lines.append(
-                f"{e['display']} {e['current']}->{e['latest']} "
-                f"({e['tier']} - apply: update-manager apply {name})"
+                f"{display} {current}->{latest} "
+                f"({tier} - apply: update-manager apply {name})"
             )
         elif status == "failed":
             lines.append(
-                f"{e['display']}: auto-apply FAILED (rolled back, "
+                f"{display}: auto-apply FAILED (rolled back, "
                 f"{e.get('fail_count', 0)}x) - check logs"
             )
         elif status == "observed-stale":
-            lines.append(f"{e['display']} {e['current']}->{e['latest']} (observed - self-updates)")
+            lines.append(f"{display} {current}->{latest} (observed - self-updates)")
     if not lines:
         return {"status": "ok", "output": "", "omit_if_empty": True}
     return {"status": "ok", "output": "Updates waiting:\n  " + "\n  ".join(lines),
@@ -548,10 +647,15 @@ def run_all(workspace_root: Path) -> dict[str, dict[str, Any]]:
                 "output": f"timeout after {exc.timeout}s",
             }
         except Exception as exc:  # noqa: BLE001 - boundary; reported inline
+            # The traceback goes to STDERR, not into the result dict. `--json`
+            # prints the dict, and a formatted traceback carries absolute paths
+            # -- home directory, username, workspace layout -- into output that
+            # is designed to be pasted elsewhere. Text mode never rendered it
+            # anyway.
+            print(traceback.format_exc(), file=sys.stderr)
             res = {
                 "status": "error",
                 "output": f"{type(exc).__name__}: {exc}",
-                "traceback": traceback.format_exc(),
             }
         res.setdefault("elapsed_ms", round((time.perf_counter() - t0) * 1000, 1))
         return key, res
@@ -565,6 +669,11 @@ def run_all(workspace_root: Path) -> dict[str, dict[str, Any]]:
     return results
 
 
+# The statuses that are NOT a failure. Everything else is, including a value
+# added later that nobody thought to list here.
+NON_FAILURE_STATUSES = frozenset({"ok", "skipped", "missing"})
+
+
 def render_text(results: dict[str, dict[str, Any]]) -> str:
     """Format aggregated results in the order /prime expects."""
     lines: list[str] = []
@@ -574,13 +683,27 @@ def render_text(results: dict[str, dict[str, Any]]) -> str:
         body = res.get("output", "").rstrip()
         # Optional sections (e.g. odin_cadence) render nothing when empty -- no
         # banner, no "(no output)" line. Keeps an up-to-date / exec workspace clean.
-        if not body and res.get("omit_if_empty"):
+        #
+        # A FAILING check is never omitted, whatever it asks for. `omit_if_empty`
+        # is a quiet-when-healthy switch, and read on its own it also silenced
+        # two checks whose child had crashed with empty stdout. Both are fixed at
+        # their source above; this second gate is what stops the next check added
+        # here from reintroducing the same disappearance. It changes nothing for
+        # a check that already reports its failure in `output`.
+        if not body and res.get("omit_if_empty") \
+                and res.get("status") in NON_FAILURE_STATUSES:
             continue
         lines.append(banner)
         if not body:
             body = "(no output)"
         lines.append(body)
-        if res.get("status") == "error":
+        # Anything that is NOT a known-good status is a failure, so its stderr
+        # is shown. Keying on `== "error"` alone meant the two checks that
+        # report `"failed"` (fireside, sync-exchange) had their diagnostics
+        # silently dropped -- exactly the two daemon checks where the stderr is
+        # the whole point. Deriving the failure set from the good one means a
+        # NEW status string cannot hide a diagnostic by accident.
+        if res.get("status") not in NON_FAILURE_STATUSES:
             stderr = res.get("stderr", "").strip()
             if stderr:
                 lines.append(f"[stderr] {stderr}")

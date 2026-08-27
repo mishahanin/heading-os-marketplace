@@ -16,6 +16,7 @@ too for callers that already import from this module.
 import functools
 import json
 import os
+import sys
 from pathlib import Path
 
 # Re-export the canonical root resolver and helpers from paths.py.
@@ -26,13 +27,16 @@ from scripts.utils.paths import (  # noqa: F401
     DataRootError,
     check_schema_compatible,
     data_dir,
+    data_overlay_present,
     data_root_is_demo,
+    env_data_root,
     get_data_root,
     get_workspace_root,
     home,
     load_env,
     log_dir,
     read_data_schema_version,
+    require_outside_engine_clone,
     require_writable_data_root,
     state_dir,
 )
@@ -210,16 +214,16 @@ def get_exec_data_root() -> Path:
     """Resolve an exec workspace's private-data root (the sibling data repo).
 
     First hit wins:
-      1. ``HEADING_OS_DATA`` env override (when it points at a real dir).
+      1. ``HEADING_OS_DATA`` env override, when it points at a real dir.
+         Set-but-missing is IGNORED with a warning, never silently (see
+         ``env_data_root``).
       2. Slug-named sibling ``../.heading-os-data-{slug}`` (provision_exec.py default).
       3. Generic resolver ``get_data_root()`` -- handles a sibling cloned as plain
          ``../.heading-os-data`` and the read-only demo fallback (with its warning).
     """
-    env = os.environ.get("HEADING_OS_DATA")
-    if env:
-        cand = Path(env).expanduser()
-        if cand.is_dir():
-            return cand.resolve()
+    env_root = env_data_root()
+    if env_root is not None:
+        return env_root
     sibling = get_workspace_root().parent / f".heading-os-data-{get_exec_slug()}"
     if sibling.is_dir():
         return sibling.resolve()
@@ -381,21 +385,50 @@ def get_crm_central_path() -> Path:
 
 
 def get_per_exec_repo_path(slug: str) -> Path:
-    """Return the local clone path for a per-exec CRM repo.
+    """Return the local clone path for an exec's DATA overlay.
 
-    Per-exec repos are sibling directories of the workspace root, named
-    `31c-crm-{slug}`. Used by both CEO (clones all execs') and execs (clones own).
+    ONE topology, and this is it: each exec's full data overlay is cloned as
+    `../.heading-os-data-{slug}` (CEO-owned, exec is a collaborator), with CRM
+    contacts inside it at `crm/contacts/`. The dotted name matches
+    `provision_exec.py` and the data-root seam, so provisioning and aggregation
+    share one clone per exec.
+
+    Until 2026-08-23 this returned `31c-crm-{slug}` - the retired model - while
+    `scripts/aggregate-crm.py` carried its own correct copy and its docstring
+    said the legacy model was retired. Two integration test files pinned the two
+    answers and the suite was green on both. The audit of that date caught it.
+    Callers that were reading the wrong sibling: `scripts/transfer-contact.py`
+    and `scripts/admin-health.py`.
     """
     if not slug or "/" in slug or "\\" in slug or ".." in slug:
         raise ValueError(f"Invalid slug: {slug!r}")
-    return get_workspace_root().parent / f"31c-crm-{slug}"
+    return get_workspace_root().parent / f".heading-os-data-{slug}"
+
+
+def get_per_exec_contacts_dir(slug: str) -> Path:
+    """Where an exec's CRM contact files live: `<their data repo>/crm/contacts/`.
+
+    The overlay is a full data repo, so contacts sit under `crm/`, exactly as
+    `get_per_exec_repo_path` describes. Five call sites joined `contacts`
+    straight onto the repo root instead, one level too high, and read an empty
+    directory as an empty fleet: on 2026-08-23 `admin-health.py` reported the
+    whole fleet DEAD with 0 contacts while two live exec overlays held 11 and
+    7 files. Two of the five WROTE there, filing contacts into a directory no
+    reader ever opens.
+
+    Exists as a helper rather than a path join so the layout is stated once.
+    """
+    return get_per_exec_repo_path(slug) / "crm" / "contacts"
 
 
 def get_all_active_exec_slugs() -> list[str]:
-    """Return sorted list of active exec slugs from config/exec-registry.json.
+    """Return sorted list of active exec slugs from the HEADING OS fleet roster.
 
-    Excludes admin role (CEO) and any non-active status. Used by aggregate-crm.py
-    to know which per-exec repos to pull from.
+    Source is `load_exec_registry()` (`<data-root>/admin/executives.json`), NOT
+    `config/exec-registry.json` - the docstring named the latter until
+    2026-08-23 while the code already called the former. Excludes admin role
+    (CEO) and any non-active status. Used by aggregate-crm.py to know which
+    per-exec repos to pull from.
     """
     registry = load_exec_registry()
     slugs = []
@@ -430,15 +463,166 @@ def load_admin_config() -> dict:
     return {}
 
 
+def _read_registry_or_empty(path: Path, what: str) -> dict:
+    """Read a registry JSON file, or return an empty one AND say why.
+
+    An ABSENT file is an empty registry and that is not an error: a data-less
+    engine clone has no fleet and no org chart. A file that EXISTS and cannot be
+    parsed is a different thing entirely, and both loaders used to answer it
+    with the same silent `{"executives": []}`. Measured 2026-08-26 against a
+    truncated `admin/executives.json` and a broken `config/exec-registry.json`:
+    `load_exec_registry`, `get_all_active_exec_slugs`, `load_business_registry`
+    and `load_fleet` all reported a fleet of zero, nothing was printed and
+    nothing raised.
+
+    That is the exact failure `load_exec_registry`'s own docstring records from
+    2026-08-23 - "the exists() guard turned the miss into an empty registry
+    rather than an error. Every caller silently saw a fleet of zero" - and the
+    corrupt-file path still did it. Callers act on the roster: offboarding,
+    CRM aggregation and admin-health all read "nobody" as a real answer.
+    Returning empty keeps them running; the stderr line is what stops empty from
+    reading as measured.
+    """
+    if not path.exists():
+        return {"version": "1.0", "executives": []}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[workspace] {what} at {path} exists but could not be read "
+              f"({type(exc).__name__}: {exc}); reporting an EMPTY registry - "
+              f"treat every 'no executives' answer this run as unmeasured",
+              file=sys.stderr)
+        return {"version": "1.0", "executives": []}
+
+
 def load_exec_registry() -> dict:
-    """Load exec registry from config/exec-registry.json."""
-    config_path = get_data_config_dir() / "exec-registry.json"
-    if config_path.exists():
-        try:
-            return json.loads(config_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-    return {"version": "1.0", "executives": []}
+    """Load the HEADING OS fleet roster from `<data-root>/admin/executives.json`.
+
+    This answers "who is provisioned as a HEADING OS user". Its single writer is
+    `../.heading-os-data/admin/provision/registry.py`.
+
+    It is NOT `<data-root>/config/exec-registry.json`, which answers a different
+    question: who is an executive at 31C (title, email, business role). That one
+    is hand-maintained and loads through `load_business_registry()`. Prefer
+    `load_fleet()` over either: it joins them on `slug` and labels which side
+    each fact came from.
+
+    Until 2026-08-23 this loader read the `config/exec-registry.json` path while
+    intending the fleet roster, so it resolved the wrong file under the wrong
+    root and the `exists()` guard turned the miss into an empty registry rather
+    than an error. Every caller silently saw a fleet of zero.
+    `scripts/aggregate-crm.py` reads the roster through its own
+    `load_fleet_registry`, which is how the fleet kept working while
+    `admin-health.py` and `transfer-contact.py` saw nobody.
+
+    An absent file still yields an empty registry: a data-less engine clone has
+    no fleet, and that is not an error.
+    """
+    registry_path = get_data_root() / "admin" / "executives.json"
+    return _read_registry_or_empty(registry_path, "the HEADING OS fleet roster")
+
+
+def load_business_registry() -> dict:
+    """Load `<data-root>/config/exec-registry.json` — the 31C ORG CHART.
+
+    Answers "who is an executive in the business": name, title, email, business
+    role, platform, employment status. Hand-maintained, not written by
+    provisioning.
+
+    Its sibling is `load_exec_registry()` (`admin/executives.json`), the HEADING
+    OS fleet roster. Prefer `load_fleet()` over either: it joins them and says
+    which side each fact came from.
+
+    An absent file yields an empty registry, same as the roster: a data-less
+    engine clone has no org chart either.
+    """
+    path = get_data_config_dir() / "exec-registry.json"
+    return _read_registry_or_empty(path, "the 31C org chart")
+
+
+# Which registry owns which fact. Split on 2026-08-23; the reasoning, and the
+# stale `aios: removed` defect that forced it, are in
+# tests/test_fleet_registry_split.py.
+_BUSINESS_FIELDS = {"name": "name", "title": "title", "email": "email",
+                    "role": "business_role", "platform": "platform",
+                    "status": "employment_status"}
+_SYSTEM_FIELDS = {"name": "name", "github_user": "github_user",
+                  "data_repo": "data_repo", "status": "provisioning_status"}
+
+
+def repo_name_for(slug: str) -> str:
+    """The GitHub repo name for an exec's data overlay, from the fleet roster.
+
+    Falls back to the `heading-os-data-{slug}` convention when the roster row
+    omits `data_repo`, which is what a hand-added row usually does.
+
+    It lives here, not in a caller, because it had a caller that did not use
+    it. `scripts/admin-health.py` resolved the name through the roster while
+    `scripts/aggregate-crm.py` hardcoded the convention, so an exec whose row
+    named a different repo had their overlay cloned correctly by the health
+    dashboard and 404'd by the CRM aggregation -- which then contributed zero
+    of their contacts and exited 0. Two fleet tools cannot drift on a repo name
+    they both read from one function.
+    """
+    for row in load_fleet():
+        if row.get("slug") == slug and row.get("data_repo"):
+            return row["data_repo"]
+    return f"heading-os-data-{slug}"
+
+
+def load_fleet() -> list[dict]:
+    """Join the org chart and the fleet roster on `slug`. Sorted by slug.
+
+    Returns one record per person appearing in EITHER file, carrying:
+
+      slug, is_business_exec, is_heading_os_user,
+      name, title, email, business_role, platform, employment_status,   (chart)
+      github_user, data_repo, provisioning_status                       (roster)
+
+    The two flags are the point. Merging the files was rejected because the
+    fleet already holds people who are one and not the other: an executive with
+    no HEADING OS install, and an install belonging to nobody on the org chart.
+    Read the flag rather than inferring membership from a `status` string —
+    BOTH files have a field called `status` and they mean different things,
+    which is why the join renames them apart.
+
+    Absent facts are None, never "" and never a guess: a caller must be able to
+    tell "this person has no roster row" from "their roster row says nothing".
+
+    `provisioning_status` runs provisioning -> provisioned -> active ->
+    offboarded | revoked. Only `active` counts as fleet membership for
+    aggregation and sync; `provisioned` means setup finished but the operator
+    has not started using the install.
+    """
+    merged: dict[str, dict] = {}
+
+    def _slot(slug: str) -> dict:
+        return merged.setdefault(slug, {
+            "slug": slug, "is_business_exec": False, "is_heading_os_user": False,
+            **dict.fromkeys(set(_BUSINESS_FIELDS.values()) | set(_SYSTEM_FIELDS.values())),
+        })
+
+    for row in load_business_registry().get("executives", []):
+        slug = row.get("slug")
+        if not slug:
+            continue
+        rec = _slot(slug)
+        rec["is_business_exec"] = True
+        for src, out in _BUSINESS_FIELDS.items():
+            if row.get(src) is not None:
+                rec[out] = row[src]
+
+    for row in load_exec_registry().get("executives", []):
+        slug = row.get("slug")
+        if not slug:
+            continue
+        rec = _slot(slug)
+        rec["is_heading_os_user"] = True
+        for src, out in _SYSTEM_FIELDS.items():
+            if row.get(src) is not None:
+                rec[out] = row[src]
+
+    return [merged[s] for s in sorted(merged)]
 
 
 @functools.lru_cache(maxsize=4)
@@ -463,13 +647,49 @@ def _load_routing_map_cached(path: str, mtime_ns: int, size: int) -> dict:
             data = yamlio.safe_load(fh) or {}
     except (OSError, yaml.YAMLError):
         return {"default": "private", "rules": {}}
+    # Valid YAML of the WRONG SHAPE is a parse error by any reading the
+    # docstring above supports, and it used to raise instead. A `rules:` block
+    # written as a list (a stray `-`, the commonest YAML slip) reached
+    # `rules.items()` and threw AttributeError out of a resolver that every
+    # classification call sits on. Found 2026-08-26 while testing the coercion
+    # below; the crash predates it. Fail closed, like every other bad read here.
+    if not isinstance(data, dict):
+        return {"default": "private", "rules": {}}
     default = data.get("default", "private")
-    rules = data.get("rules", {}) or {}
+    rules = data.get("rules") or {}
+    if not isinstance(rules, dict):
+        print(f"[workspace] routing-map `rules:` is a {type(rules).__name__}, "
+              f"not a mapping; failing closed to 'private' for every path",
+              file=sys.stderr)
+        return {"default": "private", "rules": {}}
     legal = {"engine", "private", "corporate"}
     if default not in legal:
         default = "private"
-    rules = {k: v for k, v in rules.items() if v in legal}
-    return {"default": default, "rules": rules}
+
+    # An illegal destination on a RULE now fails CLOSED to 'private'. It used to
+    # be dropped from the map entirely, and a dropped rule is not a neutral act:
+    # the path it governed falls through to `default`, and this workspace's real
+    # `config/routing-map.yaml` reads `default: engine` — the PUBLIC repository.
+    #
+    # Reproduced 2026-08-26 against a scratch map holding `default: engine` and
+    # rules {"outputs/": "privat", "crm/": "private"}, one character wrong on the
+    # first: `load_routing_map()` returned only the crm rule,
+    # `get_routing_destination("outputs/secret.md")` answered 'engine', and
+    # nothing was printed. So a typo in one value silently reclassified a whole
+    # CEO-data subtree as shareable, and the loader's own docstring promises the
+    # opposite: "any read/parse error yields default 'private'". A misspelled
+    # value is a parse-level defect and this is the direction it must fail in.
+    coerced = {}
+    for key, value in rules.items():
+        if value in legal:
+            coerced[key] = value
+            continue
+        print(f"[workspace] routing-map rule {key!r} has destination {value!r}, "
+              f"which is not one of {sorted(legal)}; treating it as 'private' "
+              f"rather than letting {key!r} fall through to the '{default}' "
+              f"default", file=sys.stderr)
+        coerced[key] = "private"
+    return {"default": default, "rules": coerced}
 
 
 def load_routing_map() -> dict:
@@ -495,6 +715,31 @@ def load_routing_map() -> dict:
     return {"default": m["default"], "rules": dict(m["rules"])}
 
 
+def matched_routing_rule(file_path: str) -> str | None:
+    """The routing-map key that governs `file_path`, or None if none does.
+
+    Split out of `get_routing_destination` on 2026-08-24 so a caller can tell
+    "this path has an explicit rule" from "this path fell through to the map
+    default". `classification-health.py --unclassified` needs exactly that
+    distinction and had no way to ask for it, so its third bucket did not exist
+    and an unclassified file was silently counted as CEO-only.
+
+    Most-specific (longest matching) key wins. A key ending in '/' matches the
+    path as a directory prefix; a key without a trailing '/' matches either that
+    exact file or that path as a prefix.
+    """
+    rules = load_routing_map()["rules"]
+    # normalize: strip leading slash, convert backslashes, collapse to posix
+    norm = file_path.replace("\\", "/").lstrip("/")
+    best_key = None
+    for key in rules:
+        k = key.rstrip("/")
+        if norm == k or norm.startswith(k + "/"):
+            if best_key is None or len(key) > len(best_key):
+                best_key = key
+    return best_key
+
+
 def get_routing_destination(file_path: str) -> str:
     """Resolve a workspace-relative path to 'engine' | 'private' | 'corporate'.
 
@@ -505,18 +750,10 @@ def get_routing_destination(file_path: str) -> str:
     Fails closed: load_routing_map() already defaults to 'private' on error.
     """
     m = load_routing_map()
-    rules = m["rules"]
-    # normalize: strip leading slash, convert backslashes, collapse to posix
-    norm = file_path.replace("\\", "/").lstrip("/")
-    best_key = None
-    for key in rules:
-        k = key.rstrip("/")
-        if norm == k or norm.startswith(k + "/"):
-            if best_key is None or len(key) > len(best_key):
-                best_key = key
+    best_key = matched_routing_rule(file_path)
     if best_key is None:
         return m["default"]
-    return rules[best_key]
+    return m["rules"][best_key]
 
 
 def get_classification(file_path: str) -> str:

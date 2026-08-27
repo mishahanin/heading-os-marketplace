@@ -16,10 +16,11 @@ Two roots, deliberately not the same thing:
     contains `scripts/utils/`. In the monorepo that is the engine; inside a
     built plugin bundle it is the bundle. It decides which layout applies.
 
-The archive follows the engine's data seam when this IS a HEADING OS tree
-(`config/routing-map.yaml` present, so the operator has a data overlay) and
-falls back to project-local `.claude/handoff/` when it is not, which is the
-case for any repository that installs the plugin bundle.
+The archive follows the engine's data seam when this is a HEADING OS tree AND a
+private overlay actually backs it. Without the overlay it goes to gitignored
+`.claude/state/handoff/`, and outside a HEADING OS tree to project-local
+`.claude/handoff/`, which is the case for any repository that installs the
+plugin bundle. See `handoff_dir()` for why the two questions are separate.
 
 Stdlib only, and it stays that way: `checkpoint-save.py` runs after the session
 context has been discarded, so an import this module cannot satisfy costs a
@@ -87,8 +88,13 @@ def is_engine_tree(root: Path) -> bool:
     """True for the HEADING OS monorepo, false for a built plugin bundle.
 
     `config/routing-map.yaml` is the engine's routing input and is not bundled,
-    so its presence separates "this operator has a data overlay" from "this is
-    somebody's repository with our plugin installed" without guessing.
+    so its presence separates "this is a HEADING OS tree" from "this is somebody
+    else's repository with our plugin installed" without guessing.
+
+    It says NOTHING about whether a private data overlay is mounted. This
+    docstring claimed it did until 2026-08-26, and `handoff_dir()` believed it:
+    a public clone answers True here and has no overlay, so handoffs were written
+    into the engine repository. Ask `data_overlay_present()` for that question.
     """
     return (root / "config" / "routing-map.yaml").is_file()
 
@@ -130,14 +136,38 @@ def handoff_dir(project: Path, root: Path | None = None) -> Path:
     the ENGINE's copy of this file and was told it was in an engine tree. It
     then wrote a stranger's handoff into the operator's data root. Measured
     2026-08-16. The hook already knows which tree it is in; it says so here.
+
+    TWO questions, not one, and conflating them leaked. `is_engine_tree()` was
+    documented as separating "this operator has a data overlay" from "somebody
+    else's repository with our plugin installed", and that belief was refuted on
+    2026-08-26: a PUBLIC clone of the engine carries `config/routing-map.yaml`
+    and no overlay at all. It took the engine branch, `get_outputs_dir()` fell to
+    its documented last resort `<workspace_root>/examples`, and whole session
+    handoffs landed in the repository that gets pushed. Measured in a worktree
+    with no sibling overlay: one suite run wrote six handoff files into
+    `examples/outputs/operations/handoff-archive/`.
+
+    So the layout question is asked first and the overlay question second. With
+    no overlay the archive goes under `.claude/state/`, which is gitignored, so a
+    handoff can never be committed by accident. `data_overlay_present()` rather
+    than `not data_root_is_demo()` on purpose: the in-tree transitional layout
+    answers the data root as the workspace root itself, which is still inside the
+    clone, and only the wider predicate refuses both.
+
+    A hook must not raise here. `checkpoint-save.py` runs after the session
+    context is gone, so a refusal that propagates costs a handoff nobody can
+    regenerate. This one redirects instead.
     """
     root = root or engine_root()
     if is_engine_tree(root):
         if str(root) not in sys.path:
             sys.path.insert(0, str(root))
+        from scripts.utils.paths import data_overlay_present
         from scripts.utils.workspace import get_outputs_dir
 
-        return get_outputs_dir() / "operations" / "handoff-archive"
+        if data_overlay_present():
+            return get_outputs_dir() / "operations" / "handoff-archive"
+        return project / ".claude" / "state" / "handoff"
     return project / ".claude" / "handoff"
 
 
@@ -166,7 +196,24 @@ def session_id(payload: dict | None = None) -> str:
     for candidate in (payload.get("session_id"), os.environ.get("CLAUDE_CODE_SESSION_ID")):
         if candidate and str(candidate).strip():
             return str(candidate).strip()
-    return "session"
+    return FALLBACK_SESSION_ID
+
+
+# The value `session_id` returns when neither the payload nor the environment
+# names one. Every id-less session shares it, so `.latest/session/` is a
+# CROSS-SESSION bucket, not one session's. Anything printing a sentence about
+# whose handoff it found has to ask `session_id_is_known` first.
+FALLBACK_SESSION_ID = "session"
+
+
+def session_id_is_known(payload: dict | None = None) -> bool:
+    """False when `session_id` fell back to the shared sentinel."""
+    payload = payload or {}
+    return any(
+        candidate and str(candidate).strip()
+        for candidate in (payload.get("session_id"),
+                          os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    )
 
 
 def safe_slug(value: str, max_len: int = 32) -> str:
@@ -190,12 +237,25 @@ def raise_unattended(state: dict) -> dict:
 
     Mutates and returns `state`; the caller writes it.
     """
+    already = "unattended_raised_auto" in state
     state["session_unattended"] = True
     state["session_unattended_at"] = utc_now().isoformat()
-    state["unattended_raised_auto"] = state.get("session_auto") is not True
-    # `None` is a real, distinct prior value: an absent `session_auto` defers to
-    # CLAUDE_HANDOFF_AUTO, which is not the same as a `session_auto` of False.
-    state["unattended_prior_auto"] = state.get("session_auto")
+    if not already:
+        # Only the FIRST raise records the prior. A second raise on an
+        # already-raised session read the `session_auto = True` that the first
+        # raise had just written and recorded it as an operator-held prior, so
+        # the following `lower_unattended` restored True: `--unattended off`
+        # printed "A pause waits for you again" while auto stayed on for the
+        # rest of the session, and the docstring's claim to undo "exactly what
+        # raise_unattended did" stopped holding. `scripts/checkpoint-paths.py`
+        # calls raise on every `--unattended on` with no already-on guard, and
+        # an accepted `--compact-at N` raises it too, so two raises is the
+        # ordinary path, not an edge case.
+        state["unattended_raised_auto"] = state.get("session_auto") is not True
+        # `None` is a real, distinct prior value: an absent `session_auto`
+        # defers to CLAUDE_HANDOFF_AUTO, which is not the same as a
+        # `session_auto` of False.
+        state["unattended_prior_auto"] = state.get("session_auto")
     state["session_auto"] = True
     # A fresh run starts its counters from zero, or last night's numbers would
     # stop tonight's work before it began.
@@ -294,7 +354,7 @@ def lower_unattended(state: dict) -> dict:
     return state
 
 
-def transcript_dir(project: Path) -> Path:
+def transcript_dir(project: Path | str) -> Path | None:
     """Where Claude Code keeps this workspace's session transcripts.
 
     The harness mangles the project path into a single directory name by
@@ -303,11 +363,25 @@ def transcript_dir(project: Path) -> Path:
     is the dot following a slash, not a typo. Derived rather than hardcoded, so a
     clone at a different path resolves its own transcripts.
 
-    Shared by `scripts/compact-now.py` and `scripts/compaction-probe.py`, which
-    both need it. It lives here rather than in either caller because the second
-    copy of a path-mangling rule is the one that stops being fixed.
+    It lives here rather than in a caller because the second copy of a
+    path-mangling rule is the one that stops being fixed. That prediction came
+    true inside this repository: `scripts/archive-transcripts.py` carried a
+    third copy until 2026-08-23, pointing at `scripts/calibrate.py` as a fourth
+    authority. Callers are `compact-now.py`, `compaction-probe.py` and
+    `archive-transcripts.py`.
+
+    **Returns None off POSIX, rather than guessing.** The two replacements do
+    not touch a backslash or a drive colon, so on Windows `C:\\Users\\...`
+    mangles to a name no directory can carry, and every caller then reads an
+    absent directory as an empty one. `archive-transcripts.py --status` printed
+    `live 0 file(s)` on every run and exited 0 - silent transcript loss, which is
+    the thing it exists to prevent. The correct Windows slug is not something
+    this repository can verify, and an unverifiable guess is worse than a
+    refusal a caller can report.
     """
-    mangled = str(project.resolve()).replace("/", "-").replace(".", "-")
+    if os.name != "posix":
+        return None                # before any Path(): off POSIX it is what raises
+    mangled = str(Path(project).resolve()).replace("/", "-").replace(".", "-")
     return Path.home() / ".claude" / "projects" / mangled
 
 
@@ -320,7 +394,7 @@ def newest_session_id(project: Path) -> str | None:
     `compact-now.py` and merely an empty window for the probe.
     """
     directory = transcript_dir(project)
-    if not directory.is_dir():
+    if directory is None or not directory.is_dir():
         return None
     newest = None
     newest_mtime = -1.0
@@ -757,12 +831,18 @@ LOCK_POLL_SECONDS = 0.01
 
 
 @contextlib.contextmanager
-def file_lock(lock_path: Path, *, wait: float = LOCK_WAIT_SECONDS):
+def file_lock(lock_path: Path, *, wait: float = LOCK_WAIT_SECONDS, label: str = "checkpoint"):
     """Hold an exclusive lock on `lock_path` for the duration of the block.
 
     Yields True when the lock is held and False when it is not, so a caller that
     wants to say something different in the degraded case can. Most callers
     ignore the value: the block runs either way.
+
+    `label` prefixes the two stderr lines. It exists because this primitive is
+    no longer checkpoint-only: `scripts/email-intelligence.py` serialises its
+    state file with it, and a message reading "checkpoint: ... busy" from an
+    email run points its reader at the wrong file. One implementation, correct
+    attribution — a second copy is the one that stops being fixed.
 
     **Bounded, never blocking.** A hook that waits forever is worse than a hook
     that races - the Stop hook has a 90-second budget and the statusline runs on
@@ -800,14 +880,14 @@ def file_lock(lock_path: Path, *, wait: float = LOCK_WAIT_SECONDS):
             except OSError:
                 if time.monotonic() >= deadline:
                     print(
-                        f"checkpoint: {lock_path.name} busy for {wait:.0f}s; "
+                        f"{label}: {lock_path.name} busy for {wait:.0f}s; "
                         "writing unlocked",
                         file=sys.stderr,
                     )
                     break
                 time.sleep(LOCK_POLL_SECONDS)
     except OSError as exc:
-        print(f"checkpoint: could not open {lock_path.name}: {exc}", file=sys.stderr)
+        print(f"{label}: could not open {lock_path.name}: {exc}", file=sys.stderr)
 
     try:
         yield held
@@ -943,4 +1023,28 @@ def prune_state_dir(state_dir: Path, keep_name: str) -> None:
             entries.append((child.stat().st_mtime, child))
         except OSError:
             continue
+
     _prune(entries, lambda path: path.unlink())
+
+    # Then every `.lock` whose state file is gone.
+    #
+    # `locked_state` creates `<name>.json.lock` beside each state file, and the
+    # glob above cannot see it: fnmatch wants a whole-name match, and
+    # `checkpoint-x.json.lock` does not end in `.json`. So the JSON half pruned
+    # at KEEP_MAX while the lock half grew forever, in the very directory this
+    # function exists to bound. Measured here: 25 state files, the cap, beside
+    # 22 orphan locks.
+    #
+    # Keying on "its state file is gone" rather than deleting each lock beside
+    # its file does BOTH jobs with one rule: the sessions pruned a line above,
+    # and every session pruned before this existed. It also cannot touch the
+    # live session's lock, since the live session's state file is right there -
+    # and that lock is the one `locked_state` is holding.
+    for lock in base.glob("checkpoint-*.json.lock"):
+        if not lock.is_file():
+            continue
+        if not lock.with_name(lock.name[:-len(".lock")]).exists():
+            try:
+                lock.unlink()
+            except OSError:
+                continue

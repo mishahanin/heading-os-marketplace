@@ -8,7 +8,7 @@ Last Updated: 2026-04-09
 ### Parse Documents
 
 ```bash
-python scripts/docparse.py parse \
+python "${CLAUDE_PLUGIN_ROOT}"/scripts/docparse.py parse \
   --files "path/to/doc.pdf" "other.pptx" \
   [--pages "1-5,10"] \
   [--dpi 150] \
@@ -22,7 +22,7 @@ Directories are auto-discovered for supported file types.
 ### Generate Visual Citation Report
 
 ```bash
-python scripts/docparse.py report \
+python "${CLAUDE_PLUGIN_ROOT}"/scripts/docparse.py report \
   --parse-json /tmp/parsed.json \
   --citations /tmp/citations.json \
   [--output-dir outputs/intel/docparse/2026-04-09/] \
@@ -106,7 +106,7 @@ boxes = find_boxes_for_quote(doc["pages"][0]["text_items"], "exact quote", dpi=1
 
 ```bash
 # Parse prospect's RFP document
-python scripts/docparse.py parse \
+python "${CLAUDE_PLUGIN_ROOT}"/scripts/docparse.py parse \
   --files "datastore/deals/prospect-rfp.pdf" \
   --output-json /tmp/prospect-parsed.json
 # Then read the JSON and analyze requirements
@@ -116,7 +116,7 @@ python scripts/docparse.py parse \
 
 ```bash
 # Parse source document for claim verification
-python scripts/docparse.py parse \
+python "${CLAUDE_PLUGIN_ROOT}"/scripts/docparse.py parse \
   --files "datastore/source-doc.pdf" \
   --output-json /tmp/source-parsed.json
 # Compare claims against parsed text with page references

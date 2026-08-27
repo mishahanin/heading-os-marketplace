@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Thread registry CLI - open, log, close, hold, reopen, list, find, show, archive-scan."""
+"""Thread registry CLI - open, log, close, hold, reopen, quiet, list, find, show, archive-scan."""
 from __future__ import annotations
 import argparse
-import os
 import re
 import shutil
 import sys
@@ -10,39 +9,21 @@ from datetime import date, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from scripts.utils.workspace import get_threads_dir, get_data_root, get_default_tz  # noqa: E402
+from scripts.utils.workspace import get_threads_dir, get_default_tz  # noqa: E402
 from scripts.utils.threads_lib import (  # noqa: E402
     ThreadFile, write_thread_file, new_thread_path,
-    ensure_active_threads_section, add_thread_to_index,
-    parse_thread_file, update_thread_hook, remove_thread_from_index,
-    scan_for_archive, is_quiet, compose_thread_hook, read_thread_hook,
+    parse_thread_file, scan_for_archive, is_quiet,
 )
+
+# This CLI writes thread files and nothing else. It used to also maintain a
+# `## Active Threads` block in the auto-memory MEMORY.md, through a `_memory_md()`
+# resolver and six index helpers; that block was retired on 2026-08-20 and the
+# writer was removed on 2026-08-27. `scripts/utils/threads_lib.py` carries the
+# full account under "The retired MEMORY.md index".
 
 
 def _threads_root() -> Path:
     return get_threads_dir()
-
-
-def _memory_md() -> Path:
-    """Resolve the canonical auto-memory MEMORY.md index.
-
-    Resolution order:
-      1. `MEMORY_MD` env var (returned as-is, no existence check; used by tests).
-      2. `<data-root>/auto-memory/MEMORY.md` -- the durable, canonical memory home
-         in the data repo (loaded into session context, indexed by memory-index).
-
-    The native per-launch harness store under `~/.claude/projects/<slug>/memory/`
-    is a runtime cache that `.claude/hooks/memory-reconcile.py` keeps in sync with
-    canonical (newest-wins, both directions) at every SessionStart -- so writing
-    canonical here propagates to the native store on the next launch from any path.
-    Targeting the native store directly (pre-split behaviour) broke after the
-    engine/data split: the project slug derives from the data-root path, which has
-    no native project dir, and reconcile's newest-wins would overwrite a native-only
-    edit with stale canonical anyway.
-    """
-    if env := os.environ.get("MEMORY_MD"):
-        return Path(env)
-    return get_data_root() / "auto-memory" / "MEMORY.md"
 
 
 def _initial_body(title: str) -> str:
@@ -56,10 +37,28 @@ def _initial_body(title: str) -> str:
 
 
 def _find_thread_by_id(threads_root: Path, thread_id: str) -> Path:
-    for type_ in ("business", "personal"):
-        candidate = threads_root / type_ / f"{thread_id}.md"
-        if candidate.exists():
-            return candidate
+    """Resolve an ID to one thread file, refusing an ambiguous hit.
+
+    The scan used to return the first match and `business` is scanned first, so
+    an ID present under BOTH types silently resolved to the business copy. That
+    is the wrong direction to fail in: personal threads are CEO-only, and a
+    `log` aimed at the personal one landed in the business file with no signal.
+    """
+    matches = [
+        threads_root / type_ / f"{thread_id}.md"
+        for type_ in ("business", "personal")
+        if (threads_root / type_ / f"{thread_id}.md").exists()
+    ]
+    if len(matches) > 1:
+        where = ", ".join(m.parent.name for m in matches)
+        raise ValueError(
+            f"thread '{thread_id}' exists under both {where}; rename one, the ID must be unique")
+    if matches:
+        # Unpacked, not indexed: the guard above already refused len > 1, so
+        # there is exactly one. `matches[0]` read as "prefer the first", which
+        # is the behaviour this function was fixed to stop having.
+        (only,) = matches
+        return only
     raise FileNotFoundError(f"thread '{thread_id}' not found in business/ or personal/")
 
 
@@ -108,17 +107,53 @@ def _prepend_log_entry(body: str, entry: str) -> str:
     return body[:insert_at] + "\n\n" + entry.rstrip("\n") + "\n" + body[insert_at:].lstrip("\n")
 
 
-def _tick_followup(body: str, index: int) -> str:
-    """Convert the Nth `- [ ]` line to `- [x]`. Index is stable: items are appended, never prepended."""
+FOLLOWUPS_HEADER = "## Open follow-ups"
+
+
+def _section_bounds(body: str, section_header: str) -> tuple[int, int] | None:
+    """(start, end) line indices of a section's BODY, or None if absent.
+
+    Same boundary rule as `_append_under_section`: a section runs to the next
+    level-2 header or end of file.
+    """
     lines = body.split("\n")
-    cursor = 0
+    start = None
     for i, line in enumerate(lines):
-        if line.lstrip().startswith("- [ ]"):
+        if line.strip() == section_header:
+            start = i + 1
+            break
+    if start is None:
+        return None
+    for j in range(start, len(lines)):
+        if lines[j].startswith("## "):
+            return start, j
+    return start, len(lines)
+
+
+def _tick_followup(body: str, index: int) -> str:
+    """Convert the Nth `- [ ]` line IN THE FOLLOW-UPS SECTION to `- [x]`.
+
+    Index is stable: items are appended, never prepended.
+
+    The scan used to run over the whole file, while the CLI help promised an
+    "index of follow-up". Any checkbox in Notes or Decisions -- or one written
+    by hand above the section -- shifted every index, so `--done 0` ticked an
+    unrelated line and left the follow-up open, silently.
+    """
+    lines = body.split("\n")
+    bounds = _section_bounds(body, FOLLOWUPS_HEADER)
+    if bounds is None:
+        raise IndexError(f"no `{FOLLOWUPS_HEADER}` section in this thread")
+    start, end = bounds
+    cursor = 0
+    for i in range(start, end):
+        if lines[i].lstrip().startswith("- [ ]"):
             if cursor == index:
-                lines[i] = line.replace("- [ ]", "- [x]", 1)
+                lines[i] = lines[i].replace("- [ ]", "- [x]", 1)
                 return "\n".join(lines)
             cursor += 1
-    raise IndexError(f"no follow-up at index {index}")
+    raise IndexError(
+        f"no follow-up at index {index}; the section holds {cursor} open item(s)")
 
 
 def cmd_open(args: argparse.Namespace) -> int:
@@ -144,15 +179,6 @@ def cmd_open(args: argparse.Namespace) -> int:
         path=path,
     )
     write_thread_file(path, thread)
-
-    memory_md = _memory_md()
-    if not memory_md.exists():
-        memory_md.parent.mkdir(parents=True, exist_ok=True)
-        memory_md.write_text("# Persistent Memory\n", encoding="utf-8")
-    ensure_active_threads_section(memory_md)
-    rel_path = f"threads/{args.type}/{path.name}"  # leak-guard: ok (relative reference string, not a filesystem path)
-    add_thread_to_index(memory_md, type_=args.type, title=args.title, path=rel_path,
-                        hook=compose_thread_hook(thread.status, thread.last_touched))
     print(f"opened: {path}")
     return 0
 
@@ -164,11 +190,6 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     threads_root = _threads_root()
     path = _find_thread_by_id(threads_root, args.thread_id)
-    # Validate MEMORY.md before mutating the thread, so a missing index file
-    # cannot leave thread/MEMORY out of sync.
-    memory_md = _memory_md()
-    if not memory_md.exists():
-        raise FileNotFoundError(f"MEMORY.md does not exist at {memory_md}")
     thread = parse_thread_file(path)
     today = datetime.now(get_default_tz()).date().isoformat()
 
@@ -193,41 +214,31 @@ def cmd_log(args: argparse.Namespace) -> int:
 
     thread.last_touched = today
     write_thread_file(path, thread)
-    rel_path = f"threads/{thread.type}/{path.name}"  # leak-guard: ok (relative reference string, not a filesystem path)
-    # The MEMORY hook points AT the thread; the event itself lives only in the
-    # body written above. See compose_thread_hook for why it carries no prose.
-    hook = compose_thread_hook(thread.status, thread.last_touched)
-    try:
-        update_thread_hook(memory_md, path=rel_path, hook=hook,
-                           quiet_until=thread.quiet_until)
-    except ValueError:
-        # Section missing or hand-edited: repair and re-add the index line.
-        ensure_active_threads_section(memory_md)
-        add_thread_to_index(memory_md, type_=thread.type, title=thread.title,
-                            path=rel_path, hook=hook,
-                            quiet_until=thread.quiet_until)
     print(f"logged to {path}")
     return 0
 
 
-def _set_status(thread_id: str, new_status: str, index_action: str,
-                reason: str | None = None) -> int:
-    """index_action: 'remove' | 'add'.
+def _set_status(thread_id: str, new_status: str, reason: str | None = None) -> int:
+    """Move a thread to `new_status`, recording `reason` as a log entry.
 
-    A status change that REMOVES a thread from the index must carry a reason.
-    Until 2026-08-17 it did not, and one operator run closed nineteen threads at
-    once with only `status` and `last_touched` written. Six of them closed over
-    a loop the deal pipeline still showed as live - one side awaiting a data
-    dump, another awaiting a meeting slot - and nothing on disk distinguished
-    those from the threads that were genuinely resolved. Reopening
-    (`index_action == "add"`) is exempt: resuming work is not a decision that
-    needs defending, and friction there buys nothing.
+    A status change that RETIRES a thread must carry a reason. Until 2026-08-17
+    it did not, and one operator run closed nineteen threads at once with only
+    `status` and `last_touched` written. Six of them closed over a loop the deal
+    pipeline still showed as live - one side awaiting a data dump, another
+    awaiting a meeting slot - and nothing on disk distinguished those from the
+    threads that were genuinely resolved. Reopening is exempt: resuming work is
+    not a decision that needs defending, and friction there buys nothing.
+
+    The test is the destination status, not an index action. It used to be
+    `index_action == "remove"`, which named a MEMORY.md index this CLI no longer
+    writes; `new_status != "active"` is the same set of commands (`close`,
+    `hold`) stated in terms that still exist.
     """
-    if index_action == "remove" and not (reason or "").strip():
+    if new_status != "active" and not (reason or "").strip():
         raise ValueError(
-            f"{new_status} needs --reason: a status change that drops a thread "
-            f"from the index must say why, or nobody can tell later whether the "
-            f"work finished or just went quiet"
+            f"{new_status} needs --reason: a status change that retires a thread "
+            f"must say why, or nobody can tell later whether the work finished "
+            f"or just went quiet"
         )
     threads_root = _threads_root()
     path = _find_thread_by_id(threads_root, thread_id)
@@ -241,32 +252,20 @@ def _set_status(thread_id: str, new_status: str, index_action: str,
         thread.body = _prepend_log_entry(
             thread.body, f"### {today} - **{verb}.** {event}\n")
     write_thread_file(path, thread)
-    rel_path = f"threads/{thread.type}/{path.name}"  # leak-guard: ok (relative reference string, not a filesystem path)
-    memory_md = _memory_md()
-    if index_action == "remove":
-        try:
-            remove_thread_from_index(memory_md, path=rel_path)
-        except ValueError:
-            pass
-    elif index_action == "add":
-        ensure_active_threads_section(memory_md)
-        add_thread_to_index(memory_md, type_=thread.type, title=thread.title,
-                            path=rel_path,
-                            hook=compose_thread_hook(thread.status, thread.last_touched))
     print(f"{thread_id}: status={new_status}")
     return 0
 
 
 def cmd_close(args: argparse.Namespace) -> int:
-    return _set_status(args.thread_id, "closed", "remove", args.reason)
+    return _set_status(args.thread_id, "closed", args.reason)
 
 
 def cmd_hold(args: argparse.Namespace) -> int:
-    return _set_status(args.thread_id, "on-hold", "remove", args.reason)
+    return _set_status(args.thread_id, "on-hold", args.reason)
 
 
 def cmd_reopen(args: argparse.Namespace) -> int:
-    return _set_status(args.thread_id, "active", "add")
+    return _set_status(args.thread_id, "active")
 
 
 def cmd_quiet(args: argparse.Namespace) -> int:
@@ -283,20 +282,6 @@ def cmd_quiet(args: argparse.Namespace) -> int:
     thread.quiet_until = None if (args.clear or args.indefinite) else args.until
     thread.do_not_remind = bool(args.indefinite)
     write_thread_file(path, thread)
-
-    rel_path = f"threads/{thread.type}/{path.name}"  # leak-guard: ok (relative reference string, not a filesystem path)
-    memory_md = _memory_md()
-    try:
-        # Recomposed, not carried over: the hook is derived state, so there is
-        # nothing in the old line worth preserving across a quiet change.
-        update_thread_hook(memory_md, path=rel_path,
-                           hook=compose_thread_hook(thread.status, thread.last_touched),
-                           quiet_until=thread.quiet_until)
-    except (ValueError, FileNotFoundError) as exc:
-        # The frontmatter -- which every reader consults -- is already correct;
-        # say the index was not, rather than implying the whole change landed.
-        print(f"warning: frontmatter updated but MEMORY.md index was not: {exc}",
-              file=sys.stderr)
     if args.clear:
         print(f"{args.thread_id}: quiet period cleared")
     elif args.indefinite:
@@ -322,38 +307,13 @@ def _all_threads(threads_root: Path) -> list[ThreadFile]:
     return threads
 
 
-def cmd_reindex(args: argparse.Namespace) -> int:
-    """Rewrite every index hook from the thread's own frontmatter.
-
-    Repairs drift between MEMORY.md and the threads it points at. It rewrites
-    HOOKS only -- it never adds or drops a line, because membership of the
-    index is a status decision (`close`/`hold`/`reopen`) and silently
-    reconciling it here would let a rebuild retire a thread nobody closed.
-    """
-    memory_md = _memory_md()
-    if not memory_md.exists():
-        print(f"MEMORY.md does not exist at {memory_md}", file=sys.stderr)
-        return 1
-    changed = missing = 0
-    for t in _all_threads(_threads_root()):
-        rel_path = f"threads/{t.type}/{t.path.name}"  # leak-guard: ok (relative reference string, not a filesystem path)
-        hook = compose_thread_hook(t.status, t.last_touched)
-        try:
-            before = read_thread_hook(memory_md, path=rel_path)
-        except (ValueError, FileNotFoundError):
-            missing += 1
-            continue
-        if before == hook:
-            continue
-        if args.dry_run:
-            print(f"would rewrite {t.id}\n  - {before}\n  + {hook}")
-        else:
-            update_thread_hook(memory_md, path=rel_path, hook=hook,
-                               quiet_until=t.quiet_until)
-        changed += 1
-    verb = "would rewrite" if args.dry_run else "rewrote"
-    print(f"{verb} {changed} hook(s); {missing} thread(s) not in the index (expected for closed/on-hold)")
-    return 0
+# `cmd_reindex` stood here and rewrote every MEMORY.md hook from thread
+# frontmatter, to repair drift between the index and the threads it pointed at.
+# It went with the index on 2026-08-27: with no copy of the record, there is
+# nothing to reconcile, and `list` reads the thread files directly. Its
+# subcommand was removed from the parser in the same change, so `thread.py
+# reindex` now exits 2 with argparse's "invalid choice" rather than silently
+# doing nothing.
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -366,7 +326,16 @@ def cmd_list(args: argparse.Namespace) -> int:
         threads = [t for t in threads if t.status == "active"]
     today = datetime.now(get_default_tz()).date()
     for t in threads:
-        quiet = f" [quiet until {t.quiet_until}]" if is_quiet(t, today) else ""
+        # `do_not_remind` is tested FIRST because `is_quiet` is true for it while
+        # `quiet_until` is None, and the single-branch version interpolated that
+        # None: an indefinitely frozen thread listed as `[quiet until None]`,
+        # which is neither the documented suffix nor a date anyone can act on.
+        if t.do_not_remind:
+            quiet = " [quiet indefinitely]"
+        elif is_quiet(t, today):
+            quiet = f" [quiet until {t.quiet_until}]"
+        else:
+            quiet = ""
         print(f"[{t.status}] {t.type}/{t.id} - {t.title} (last_touched: {t.last_touched}){quiet}")
     return 0
 
@@ -397,17 +366,14 @@ def cmd_archive_scan(args: argparse.Namespace) -> int:
             year = today.strftime("%Y")
             type_ = c.path.parent.name
             dest_dir = _threads_root() / "archive" / year / type_
-            dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / c.path.name
             if args.apply:
-                # Defensive: ensure no orphan MEMORY.md link survives the move.
-                # /thread close should have already removed the line, but a hand-
-                # edit or stale state could leave it. Catch ValueError silently.
-                rel_path = f"threads/{type_}/{c.path.name}"  # leak-guard: ok (relative reference string, not a filesystem path)
-                try:
-                    remove_thread_from_index(_memory_md(), path=rel_path)
-                except ValueError:
-                    pass  # line already absent (closed/on-hold thread) - expected
+                # The mkdir lives INSIDE the apply branch. It used to sit above
+                # this `if`, so a plain `archive-scan` with no --apply printed
+                # "would archive:" and created `threads/archive/<year>/<type>/`
+                # on disk anyway - a filesystem side effect from a command whose
+                # whole contract is that it previews and changes nothing.
+                dest_dir.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(c.path), str(dest))
                 print(f"archived: {c.path} -> {dest} ({c.reason})")
             else:
@@ -449,17 +415,16 @@ def main(argv: list[str] | None = None) -> int:
     p_quiet = sub.add_parser(
         "quiet", help="Suppress a thread from proactive surfacing until a date")
     p_quiet.add_argument("thread_id")
-    p_quiet.add_argument("--until", metavar="YYYY-MM-DD",
-                         help="Last date on which the thread stays quiet")
-    p_quiet.add_argument("--indefinite", action="store_true",
-                         help="Quiet with no end date; lifts only when you raise it")
-    p_quiet.add_argument("--clear", action="store_true", help="Lift the quiet period")
+    # Mutually exclusive: the three express one choice, and combining them used
+    # to be accepted silently with --clear winning, so `--until 2026-09-01
+    # --clear` reported "quiet period cleared" for someone who meant to set one.
+    q_mode = p_quiet.add_mutually_exclusive_group(required=True)
+    q_mode.add_argument("--until", metavar="YYYY-MM-DD",
+                        help="Last date on which the thread stays quiet")
+    q_mode.add_argument("--indefinite", action="store_true",
+                        help="Quiet with no end date; lifts only when you raise it")
+    q_mode.add_argument("--clear", action="store_true", help="Lift the quiet period")
     p_quiet.set_defaults(func=cmd_quiet)
-    p_reindex = sub.add_parser(
-        "reindex", help="Rewrite every MEMORY.md hook from thread frontmatter")
-    p_reindex.add_argument("--dry-run", action="store_true",
-                           help="Show what would change without writing")
-    p_reindex.set_defaults(func=cmd_reindex)
     p_list = sub.add_parser("list", help="List threads")
     p_list.add_argument("--type", choices=["business", "personal"])
     p_list.add_argument("--status", choices=["active", "on-hold", "closed"])
@@ -474,8 +439,9 @@ def main(argv: list[str] | None = None) -> int:
     p_arch.add_argument("--apply", action="store_true", help="Actually move files (default: dry-run)")
     p_arch.set_defaults(func=cmd_archive_scan)
     args = parser.parse_args(argv)
-    if not hasattr(args, "func"):
-        parser.error(f"subcommand '{args.cmd}' has no handler registered")
+    # No `hasattr(args, "func")` guard here: subparsers are required=True and
+    # every one sets a handler, so the branch could not run. The invariant is
+    # checked at CI time instead, by test_every_thread_subcommand_has_a_handler.
     try:
         return args.func(args)
     except (FileNotFoundError, IndexError, RuntimeError, ValueError) as exc:

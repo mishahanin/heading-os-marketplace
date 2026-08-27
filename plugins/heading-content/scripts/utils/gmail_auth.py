@@ -17,6 +17,7 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -24,6 +25,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.utils.atomic import atomic_write_text  # noqa: E402
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -58,7 +61,22 @@ def get_service():
     token = token_path()
     creds = None
     if os.path.exists(token):
-        creds = Credentials.from_authorized_user_file(token, SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(token, SCOPES)
+        except (ValueError, json.JSONDecodeError) as exc:
+            # A token file that exists but cannot be read is the normal outcome of
+            # an interrupted write, a revoked grant, or a hand edit: the library
+            # raises JSONDecodeError on a truncated file and ValueError on valid
+            # JSON missing `refresh_token`. Neither was caught, so `get_service`
+            # raised out of a helper whose only caller-side handler
+            # (`scripts/gmail-reader.py`) catches FileNotFoundError - the operator
+            # got a traceback instead of a re-authorisation.
+            #
+            # A None here is not a silent default: it falls through to the same
+            # consent flow a first run takes, and the reason is stated first.
+            print(f"gmail_auth: the saved token at {token} is unusable "
+                  f"({type(exc).__name__}: {exc}); re-authorising.", file=sys.stderr)
+            creds = None
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
@@ -71,7 +89,11 @@ def get_service():
                 )
             creds = InstalledAppFlow.from_client_secrets_file(secrets, SCOPES).run_local_server(port=0)
         os.makedirs(os.path.dirname(token), mode=0o700, exist_ok=True)
-        with open(token, "w") as fh:
-            fh.write(creds.to_json())
-        os.chmod(token, 0o600)
+        # tmp + os.replace, not open("w"). The refresh token is the whole Gmail
+        # path's credential: a plain open truncates in place, so a crash or a
+        # concurrent reader between truncate and write leaves an empty or
+        # half-written token, and every caller then re-runs the browser OAuth
+        # dance on a headless machine. atomic_write_text sets the mode on the
+        # tempfile before the rename, so the file is never briefly world-readable.
+        atomic_write_text(Path(token), creds.to_json(), mode=0o600)
     return build("gmail", "v1", credentials=creds)

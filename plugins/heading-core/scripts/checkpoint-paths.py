@@ -43,6 +43,8 @@ cheap; leave the sleepers out.
 Tests: tests/test_checkpoint_state_lock.py, tests/test_unattended_state_machine.py
 Tests: tests/test_session_compaction_threshold.py, tests/test_checkpoint_write_path.py
 Tests: tests/test_checkpoint_operator_surface.py, tests/test_checkpoint_stamp_timezone.py
+
+Tests: tests/test_a_heading_match_that_was_never_anchored.py
 """
 
 import argparse
@@ -507,7 +509,9 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--kind",
         choices=("manual", "auto"),
-        default="manual",
+        # No default here, so `main` can tell "the operator typed --kind" from
+        # "nobody said". The dump still defaults to manual; see `collect` below.
+        default=None,
         help="archive kind segment: manual for an operator-typed /checkpoint, "
              "auto for a save the Stop hook asked for",
     )
@@ -518,22 +522,40 @@ def main(argv=None) -> int:
     )
     args = ap.parse_args(argv)
 
-    if args.compact_history:
-        return compact_history()
+    # Run EVERY action the operator asked for, in declaration order. This
+    # dispatched on the first match and returned until 2026-08-24, so
+    # `--auto on --compact-at 35` — the exact pairing the comment on
+    # `compact_at_switch` says the operator types together — silently applied
+    # only the first and never set the threshold. argparse accepts the
+    # combination without complaint, so nothing told them half the command had
+    # been dropped.
+    actions = [
+        (args.compact_history, lambda: compact_history()),
+        (args.auto, lambda: auto_switch(args.auto)),
+        (args.unattended, lambda: unattended_switch(args.unattended)),
+        (args.done is not None, lambda: done_marker(args.done)),
+        (args.compact_at is not None, lambda: compact_at_switch(args.compact_at)),
+    ]
+    requested = [run for wanted, run in actions if wanted]
+    if requested:
+        if args.json:
+            print("--json describes the paths dump and does not apply to an "
+                  "action flag; ignoring it.", file=sys.stderr)
+        if args.kind is not None:
+            # The same warning, for the same reason. `--kind` is read only by
+            # the paths dump, which an action flag makes unreachable, so
+            # `--auto on --kind auto` applied the switch and dropped the kind
+            # without a word - while `--json` in the identical position was
+            # warned about two lines up. Two flags, one situation, one rule.
+            print("--kind describes the paths dump and does not apply to an "
+                  "action flag; ignoring it.", file=sys.stderr)
+        # The first refusal is the exit code, and the rest still run: a rejected
+        # threshold must not silently cancel a switch the operator also asked
+        # for, which is the same swallowing in a different direction.
+        codes = [run() for run in requested]
+        return next((c for c in codes if c != 0), 0)
 
-    if args.auto:
-        return auto_switch(args.auto)
-
-    if args.unattended:
-        return unattended_switch(args.unattended)
-
-    if args.done is not None:
-        return done_marker(args.done)
-
-    if args.compact_at is not None:
-        return compact_at_switch(args.compact_at)
-
-    paths = collect(args.kind)
+    paths = collect(args.kind or "manual")
     if args.json:
         print(json.dumps(paths, indent=2))
     else:

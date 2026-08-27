@@ -106,6 +106,24 @@ def _atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
         raise
 
 
+def _serialize(entry: dict) -> str:
+    """JSON for one dead-letter entry, keeping the entry when the payload cannot.
+
+    `default=str` handles the ordinary un-encodable values (Path, datetime,
+    Exception). A payload that still refuses - a circular reference - costs the
+    payload, never the record: the classification and the error are what the
+    operator needs to decide on a retry, and losing them because one nested
+    value was odd is the worse outcome.
+    """
+    try:
+        return json.dumps(entry, indent=2, default=str) + "\n"
+    except (TypeError, ValueError) as exc:
+        salvaged = dict(entry)
+        salvaged["payload"] = None
+        salvaged["payload_error"] = f"{type(exc).__name__}: {exc}"
+        return json.dumps(salvaged, indent=2, default=str) + "\n"
+
+
 def record(
     trace_id: str,
     kind: str,
@@ -139,9 +157,16 @@ def record(
     }
     try:
         path = dead_letter_dir(workspace_root) / f"{tid}__{knd}.json"
-        _atomic_write(path, json.dumps(entry, indent=2) + "\n", mode=0o600)
+        _atomic_write(path, _serialize(entry), mode=0o600)
         return path
-    except OSError as e:
+    except (OSError, TypeError, ValueError) as e:
+        # TypeError and ValueError joined OSError because the promise above is
+        # "Never raises" and only OSError was caught. `json.dumps` raises
+        # TypeError on a payload holding anything it cannot encode - a Path, a
+        # datetime, an Exception, a set - and ValueError on a circular
+        # reference. The callers are finalizers that are ALREADY handling a
+        # failure, so the escape landed in the one place with nothing left to
+        # catch it.
         _log.warning("dead-letter write failed for trace_id=%s kind=%s: %s", trace_id, kind, e)
         return None
 
@@ -158,8 +183,22 @@ def list_entries(*, workspace_root: Path | None = None) -> list[Path]:
 
 
 def load(path: Path) -> dict:
-    """Load and parse a single dead-letter entry."""
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    """Load and parse a single dead-letter entry.
+
+    Raises ValueError when the file is not an object. The annotation said dict
+    and the body returned whatever `json.loads` gave it, so a truncated or
+    hand-edited artifact holding `[]` or `null` reached `entry.get(...)` in
+    `scripts/dead-letter.py` as an AttributeError, past handlers that catch only
+    OSError and JSONDecodeError. `json.JSONDecodeError` is itself a ValueError,
+    so a caller that widens its except clause to ValueError keeps catching both.
+    """
+    entry = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"dead-letter entry {Path(path).name} is "
+            f"{type(entry).__name__}, not an object"
+        )
+    return entry
 
 
 def purge(older_than_days: int = 90, *, workspace_root: Path | None = None) -> int:

@@ -59,6 +59,14 @@ RELATIONSHIP_DOMAINS: dict[str, list[str]] = {
 # Any relationship_type not in the table above resolves to this fallback.
 _DEFAULT_DOMAINS = ["communication", "persuasion"]
 
+# The types that get NO principle citation, ever. Named as a set rather than
+# left implicit in "their domain list happens to be empty", because that
+# accident is what let a pipeline stage union deal-side domains onto an internal
+# contact. Derived from the table so the two cannot drift.
+INTERNAL_TYPES = frozenset(
+    key for key, domains in RELATIONSHIP_DOMAINS.items() if not domains
+)
+
 # (pipeline stage -> additive domains, unioned with the relationship domains).
 # Stage strings are case-sensitive, matching crm/config.md / context/pipeline.md.
 STAGE_DOMAINS: dict[str, list[str]] = {
@@ -86,11 +94,20 @@ def _load_principles(brain_root: Path | None) -> list[dict]:
     for f in sorted(pdir.glob("*.md")):
         try:
             text = f.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # UnicodeDecodeError is NOT an OSError, and a principle file saved
+            # in cp1251 is the ordinary way to hit it. "Never raises" has to
+            # cover the decode as well as the read.
             continue  # skip an unreadable file; do not fail the whole query
         fm, _body = parse_frontmatter(text)
-        kw = fm.get("keywords", [])
-        if isinstance(kw, str):
+        # `keywords:` with no value after it is valid YAML and parses to None,
+        # so `.get("keywords", [])` returns None, not the default - the key is
+        # present. `[str(k) for k in None]` then raises TypeError out of a
+        # function whose docstring ends "Never raises", taking down every
+        # /odin consult that reads that one principle. A bare scalar
+        # (`keywords: strategy`) is already normalised below; a number was not.
+        kw = fm.get("keywords") or []
+        if not isinstance(kw, (list, tuple, set)):
             kw = [kw]
         out.append({
             "slug": f.stem,
@@ -125,7 +142,20 @@ def principles_for_domains(domains, *, limit: int = 5, brain_root: Path | None =
 def relevant_principles_for(relationship_type, stage=None, *, limit: int = 5,
                             brain_root: Path | None = None) -> list[dict]:
     """Resolve a contact's (relationship_type, stage) to relevant principles.
-    Internal types (tribe/tribe-leadership/inactive) resolve to [] -> no citation."""
+
+    Internal types (tribe/tribe-leadership/inactive) resolve to [] -> no
+    citation, WHATEVER stage is passed.
+
+    That last clause is the fix. The suppression was never conditioned on the
+    relationship type at all: it was a side effect of the type's domain list
+    being empty, and the stage domains were then unioned onto that empty list.
+    So `relevant_principles_for("tribe", "Negotiation")` returned deal-side
+    citations, contradicting this docstring and the module docstring both.
+    Reproduced 2026-08-25. `scripts/odin-principles.py` passes `args.type,
+    args.stage` straight through, so nothing upstream prevented the pairing.
+    """
+    if relationship_type in INTERNAL_TYPES:
+        return []
     domains = list(RELATIONSHIP_DOMAINS.get(relationship_type, _DEFAULT_DOMAINS))
     domains += STAGE_DOMAINS.get(stage, [])
     return principles_for_domains(domains, limit=limit, brain_root=brain_root)

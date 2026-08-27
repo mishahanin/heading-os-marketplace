@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Iterator
 
 from scripts.utils.air_gap import is_denied
+from scripts.utils.sqlite_uri import read_only_uri
 
 # Imports, variables and constants are excluded: a vector for `import json`
 # retrieves nothing and dilutes every neighbour it sits beside.
@@ -81,7 +82,7 @@ def iter_symbols(
     if not graph_db.exists():
         raise ValueError(f"CodeGraph index not found: {graph_db}")
 
-    conn = sqlite3.connect(f"file:{graph_db}?mode=ro", uri=True)
+    conn = sqlite3.connect(read_only_uri(graph_db), uri=True)
     try:
         # `json_each` rather than a generated `IN (?,?,?)` list: the placeholder
         # count is the only thing an f-string was building here, and building ANY
@@ -118,9 +119,24 @@ def iter_symbols(
 
         # The index lags the tree. A range past the end means the file changed
         # under us; skip rather than embed whatever now lives at those lines.
-        if not (1 <= start <= len(lines)) or end < start:
+        #
+        # `end` was not checked, only `start`. A node recorded as m.py:1-40 whose
+        # file is now 3 lines passed the start test, `min(end, len(lines))`
+        # silently clamped the slice to the whole file, and the record was
+        # yielded with `path` reading "m.py:1-40". So the embedding carried a
+        # whole unrelated file under a label naming a range that does not exist,
+        # which is exactly the "wrong slice" this comment says is worse than a
+        # gap. Measured 2026-08-26 on a scratch graph.
+        #
+        # Cost of the strict check, measured against the live
+        # `.codegraph/codegraph.db` the same day: of 27 777 nodes with an end
+        # line, 1 067 overshoot their file, every one of them by exactly 1 and
+        # every one of them `kind='file'`. `EMBEDDABLE_KINDS` excludes `file`,
+        # so the SQL above never returns one and this skip drops nothing that
+        # is embedded today.
+        if not (1 <= start <= len(lines)) or not (start <= end <= len(lines)):
             continue
-        slice_ = "\n".join(lines[start - 1:min(end, len(lines))])
+        slice_ = "\n".join(lines[start - 1:end])
 
         doc = extract_docstring(text, name)
         parts = [signature.strip() or f"{kind} {name}"]

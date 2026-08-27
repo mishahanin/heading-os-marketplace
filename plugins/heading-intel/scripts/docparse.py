@@ -16,6 +16,8 @@ Prerequisites:
     Node.js 18+  (https://nodejs.org/)
     npm install -g @llamaindex/liteparse
     pip install liteparse==2.0.0
+
+Tests: tests/test_a_citation_that_pointed_at_the_wrong_document.py
 """
 
 import argparse
@@ -41,6 +43,15 @@ CACHE_DIR = WORKSPACE / ".cache" / "docparse"
 DEFAULT_DPI = 150
 DEFAULT_OUTPUT_DIR = get_outputs_dir() / "intel" / "docparse"
 CACHE_TTL_HOURS = 168  # 7 days
+
+# One constant, because three copies disagreed. Until 2026-08-23 the installer
+# pinned 1.2.1 while `parse_document` was written against the 2.0 constructor
+# (`dpi`, `target_pages` and `password` moved into `LiteParse(...)` there), so
+# running the documented `setup --install` produced a package whose constructor
+# rejects every one of those keywords -- a "successful" setup followed by a
+# TypeError on the first document. `tests/test_docparse_liteparse_pin.py` fails
+# if the three places drift apart again.
+LITEPARSE_VERSION = "2.0.0"
 MAX_REPORT_PAGES = 20
 
 # Supported file extensions for auto-discovery
@@ -56,13 +67,32 @@ PLAINTEXT_EXTENSIONS = {".txt", ".md", ".rst", ".csv", ".tsv"}
 # Cache Helpers
 # ============================================================
 
-def _cache_key(file_path: Path, password: str = "") -> str:
-    """Compute cache key from resolved path, size, mtime, and optional password.
+def _cache_key(
+    file_path: Path,
+    password: str = "",
+    pages: str | None = None,
+    dpi: int = DEFAULT_DPI,
+) -> str:
+    """Compute the cache key for one parse REQUEST, not just for the file.
 
-    Uses Path.resolve() which normalizes case on Windows NTFS.
+    `pages` and `dpi` are part of the key because they change the content of
+    the returned document. Keyed on the file alone, `--pages 1-2` wrote a
+    two-page result that every later full parse of the same file was served as
+    if it were the whole document -- and the cached dict carries `"dpi": dpi`
+    from whichever run populated it, so the substitution labelled itself
+    truthfully while being wrong. `scrape_cache_key` in `firecrawl.py` carries
+    the same fix for the same reason.
+
+    `Path.resolve()` case-normalizes on Windows NTFS, and that guarantee is
+    real HERE specifically: `stat()` on the line below establishes the file
+    exists, so `realpath` reaches `_getfinalpathname`
+    (`GetFinalPathNameByHandle`), which returns the casing as stored on disk.
+    The non-strict fallback, which does NOT canonicalize a missing tail, is
+    unreachable for a file that just stat-ed.
     """
     stat = file_path.stat()
-    raw = f"{file_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+    raw = (f"{file_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}"
+           f":pages={pages or 'all'}:dpi={dpi}")
     if password:
         raw += f":{hashlib.sha256(password.encode()).hexdigest()}"
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -82,7 +112,14 @@ def _cache_get(key: str) -> dict | None:
             cache_file.unlink(missing_ok=True)
             return None
         return data
-    except (json.JSONDecodeError, OSError, KeyError) as e:
+    except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as e:
+        # TypeError and ValueError joined the tuple on 2026-08-24. This handler
+        # exists so a corrupt entry REGENERATES cleanly, and the two things a
+        # corrupt `_cached_at` actually raises were both outside it:
+        # `fromisoformat` raises ValueError on a malformed string and TypeError
+        # on a non-string, and a naive datetime stored there raises TypeError
+        # at the subtraction below. Any of them crashed the whole parse run —
+        # the precise scenario the handler was built to absorb.
         print(f"  {YELLOW}Warning:{RESET} Cache entry corrupt, regenerating: {e}", file=sys.stderr)
         cache_file.unlink(missing_ok=True)
         return None
@@ -128,7 +165,7 @@ def parse_document(
         raise FileNotFoundError(f"File not found: {fp}")
 
     pwd = password or ""
-    key = _cache_key(fp, pwd)
+    key = _cache_key(fp, pwd, pages, dpi)
 
     if not no_cache:
         cached = _cache_get(key)
@@ -217,9 +254,9 @@ def find_boxes_for_quote(
             char_to_item.append(idx)
 
     raw_concat = "".join(raw_chars)
-    # Apply normalization to both the full text and the quote
-    norm_concat = _normalize_text(raw_concat).lower()
-    norm_quote = _normalize_text(quote).lower()
+    # Compared BEFORE lowering, because lowering is not part of
+    # `_normalize_text` and comparing after it hid a real desync (see below).
+    norm_concat = _normalize_text(raw_concat)
 
     # Rebuild char_to_item mapping after normalization (whitespace collapsing
     # can shift indices). We re-walk the raw text applying the same transforms.
@@ -236,7 +273,7 @@ def find_boxes_for_quote(
         if nch == "":
             continue  # soft hyphen removed
         for c in nch:  # ligatures expand to multiple chars
-            if c in " \t\n\r":
+            if _WS_CHAR_RE.fullmatch(c):
                 if not prev_space:
                     norm_chars.append(" ")
                     norm_char_to_item.append(char_to_item[i])
@@ -254,7 +291,38 @@ def find_boxes_for_quote(
         norm_chars.pop()
         norm_char_to_item.pop()
 
-    concat = "".join(norm_chars).lower()
+    if "".join(norm_chars) != norm_concat:
+        # `norm_concat` was computed and never used. That is not harmless here:
+        # the loop above RE-IMPLEMENTS `_normalize_text` inline, because it has
+        # to carry the char-to-item mapping along, and the two copies must
+        # agree for the box lookup to point at the right text. With the
+        # variable unused, nothing compared them, so an edit to
+        # `_normalize_text` would desync the matcher silently. Comparing is the
+        # whole reason to keep it.
+        print(f"  {YELLOW}Warning:{RESET} the inline normalization in "
+              f"find_boxes_for_quote has drifted from _normalize_text; "
+              f"bounding boxes may point at the wrong text.", file=sys.stderr)
+    # Lower PER CHARACTER, growing the mapping with it. Lowering the joined
+    # string left the mapping at its pre-lowering length, so a character whose
+    # lowercase is longer than itself (U+0130, capital I with dot above,
+    # lowercases to two code points) shifted every index after it and the
+    # boxes landed on neighbouring text. It was silent: the drift guard
+    # lowercased both sides identically, so it never saw a difference. The
+    # quote is lowered the same way, which keeps the two sides consistent even
+    # where per-character and whole-string lowercasing legitimately differ
+    # (Greek final sigma).
+    lowered = []
+    lowered_to_item = []
+    # strict=True: the two lists are appended in lockstep just above, so a
+    # length mismatch is an internal bug, and silently truncating to the
+    # shorter one is how a char-to-item map goes quietly wrong.
+    for ch, item_idx in zip(norm_chars, norm_char_to_item, strict=True):
+        low = ch.lower()
+        lowered.append(low)
+        lowered_to_item.extend([item_idx] * len(low))
+    concat = "".join(lowered)
+    norm_quote = "".join(c.lower() for c in _normalize_text(quote))
+
     pos = concat.find(norm_quote)
     if pos == -1:
         return []
@@ -262,8 +330,8 @@ def find_boxes_for_quote(
     # Find which items are involved in the match
     matched_items = set()
     for i in range(pos, pos + len(norm_quote)):
-        if i < len(norm_char_to_item):
-            matched_items.add(norm_char_to_item[i])
+        if i < len(lowered_to_item):
+            matched_items.add(lowered_to_item[i])
 
     # Collect and merge bounding boxes
     boxes = []
@@ -278,6 +346,17 @@ def find_boxes_for_quote(
 
     return _merge_adjacent_boxes(boxes)
 
+
+# ONE definition of "whitespace", compiled two ways. `_normalize_text` used
+# `\s+` while the inline walk in `find_boxes_for_quote` tested `c in " \t\n\r"`,
+# and `\s` matches more than those four -- `\x0b`, `\x0c` (form feed, common in
+# extracted PDF text), `U+0085`, `U+2028`, `U+2029`. A quote spanning a form
+# feed normalized to a space on one side and stayed a form feed on the other,
+# so the lookup missed, the citation rendered with no highlight, and the drift
+# guard fired about the very desync it was added to catch.
+_WS_PATTERN = r"\s"
+_WS_CHAR_RE = re.compile(_WS_PATTERN)
+_WS_RUN_RE = re.compile(_WS_PATTERN + "+")
 
 _REPLACEMENTS = {
     "\u2018": "'", "\u2019": "'",  # smart single quotes
@@ -294,8 +373,9 @@ def _normalize_text(text: str) -> str:
     """Normalize typographic variations for matching."""
     for old, new in _REPLACEMENTS.items():
         text = text.replace(old, new)
-    # Collapse whitespace
-    text = re.sub(r"\s+", " ", text).strip()
+    # Collapse whitespace. Same `_WS_PATTERN` the inline walk in
+    # `find_boxes_for_quote` tests against, so the two cannot disagree.
+    text = _WS_RUN_RE.sub(" ", text).strip()
     return text
 
 
@@ -361,7 +441,7 @@ def _generate_report_html(
         screenshot_key = (file_name, page_num)
 
         # Find bounding boxes for this quote
-        page_data = _find_page_in_parse(parse_data, file_name, page_num)
+        page_data, ambiguous = _find_page_in_parse(parse_data, file_name, page_num)
         dpi = DEFAULT_DPI
         if page_data:
             boxes = find_boxes_for_quote(page_data.get("text_items", []), quote_text, dpi)
@@ -372,11 +452,12 @@ def _generate_report_html(
             page_w_px = 800
             page_h_px = 600
 
-        # Screenshot image
-        img_bytes = page_screenshots.get(screenshot_key)
+        # Screenshot image. Withheld when the name resolves to more than one
+        # document: showing SOME page under an unresolved name is the defect.
+        img_bytes = None if ambiguous else page_screenshots.get(screenshot_key)
         if img_bytes:
             img_b64 = base64.b64encode(img_bytes).decode("ascii")
-            img_src = f"data:image/jpeg;base64,{img_b64}"
+            img_src = f"data:{_image_mime(img_bytes)};base64,{img_b64}"
         else:
             img_src = ""
 
@@ -389,22 +470,28 @@ def _generate_report_html(
                 f'fill="rgba(91,95,255,0.2)" stroke="#5B5FFF" stroke-width="2"/>\n'
             )
 
+        ambiguity_note = "" if not ambiguous else (
+            f'\n      <div class="cite-ambiguous">More than one parsed document '
+            f'is named {html.escape(file_name)}. This citation does not say '
+            f'which, so no page image or highlight is shown. Cite the full path '
+            f'to resolve it.</div>')
+
         card = f"""
-    <section class="citation-card" id="cite-{cit_id}">
+    <section class="citation-card" id="cite-{html.escape(str(cit_id), quote=True)}">
       <div class="card-header">
-        <span class="cite-num">[{cit_id}]</span>
-        <span class="cite-source">{html.escape(file_name)} - Page {page_num}</span>
-      </div>
+        <span class="cite-num">[{html.escape(str(cit_id))}]</span>
+        <span class="cite-source">{html.escape(file_name)} - Page {html.escape(str(page_num))}</span>
+      </div>{ambiguity_note}
       <div class="card-body">
         <div class="page-view">
           {"" if not img_src else f'''<div class="page-image-container">
-            <img src="{img_src}" class="page-image" alt="Page {page_num}">
+            <img src="{img_src}" class="page-image" alt="Page {html.escape(str(page_num))}">
             <svg class="highlight-overlay" viewBox="0 0 {page_w_px:.0f} {page_h_px:.0f}"
                  preserveAspectRatio="none">
               {svg_rects}
             </svg>
           </div>'''}
-          <div class="page-label">Page {page_num}</div>
+          <div class="page-label">Page {html.escape(str(page_num))}</div>
         </div>
         <div class="finding-panel">
           <div class="quote-block">
@@ -521,6 +608,14 @@ def _generate_report_html(
     margin-right: 8px;
   }}
   .cite-source {{ color: var(--text-muted); }}
+  .cite-ambiguous {{
+    margin: 0 1.25rem 0.75rem;
+    padding: 0.6rem 0.85rem;
+    border-left: 3px solid #F5922B;
+    background: rgba(245,146,43,0.08);
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }}
 
   .card-body {{
     display: grid;
@@ -619,14 +714,43 @@ def _generate_report_html(
 </html>"""
 
 
-def _find_page_in_parse(parse_data: dict, file_name: str, page_num: int) -> dict | None:
-    """Find a specific page in the parse data by file name and page number."""
-    for f in parse_data.get("files", []):
-        if f.get("file_name") == file_name or Path(f.get("file", "")).name == file_name:
-            for p in f.get("pages", []):
-                if p.get("page_num") == page_num:
-                    return p
-    return None
+def _resolve_parse_file(parse_data: dict, file_name: str) -> tuple[dict | None, bool]:
+    """Resolve a citation's `file` to EXACTLY one parsed file.
+
+    Returns `(file_dict, ambiguous)`. Matching was on basename alone, and
+    `parse --files dirA dirB` auto-discovers both, so two different documents
+    called `report.pdf` collided: the first one found answered for both, and a
+    citation about the second rendered the first document's page and the first
+    document's highlight boxes with no visible sign of the substitution. A
+    mis-citation shown with full confidence is worse than a missing one, so
+    where the name does not identify one file this refuses to pick.
+
+    `cmd_clear_cache` already treats the shared-basename case as a hazard; this
+    is the same hazard on the reporting side.
+    """
+    files = parse_data.get("files", [])
+    for f in files:
+        if f.get("file") == file_name:      # a full path identifies one file
+            return f, False
+    matches = [f for f in files
+               if f.get("file_name") == file_name
+               or Path(f.get("file", "")).name == file_name]
+    if len(matches) == 1:
+        return matches[0], False
+    return None, len(matches) > 1
+
+
+def _find_page_in_parse(
+    parse_data: dict, file_name: str, page_num: int
+) -> tuple[dict | None, bool]:
+    """Find one page by file name and number. Returns `(page, ambiguous)`."""
+    parse_file, ambiguous = _resolve_parse_file(parse_data, file_name)
+    if parse_file is None:
+        return None, ambiguous
+    for p in parse_file.get("pages", []):
+        if p.get("page_num") == page_num:
+            return p, False
+    return None, False
 
 
 def _markdown_to_html(md: str) -> str:
@@ -696,7 +820,7 @@ def _setup_check() -> bool:
         print(f"  {GREEN}OK{RESET}  liteparse Python package installed")
     except ImportError:
         print(f"  {RED}FAIL{RESET}  liteparse Python package not installed")
-        print(f"         Install: pip install liteparse==2.0.0")
+        print(f"         Install: pip install liteparse=={LITEPARSE_VERSION}")
         all_ok = False
 
     if all_ok:
@@ -732,7 +856,7 @@ def _setup_install():
     except ImportError:
         print(f"  {CYAN}Installing{RESET} liteparse Python package...")
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "liteparse==1.2.1"],
+            [sys.executable, "-m", "pip", "install", f"liteparse=={LITEPARSE_VERSION}"],
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode == 0:
@@ -747,6 +871,28 @@ def _setup_install():
 # ============================================================
 # Subcommand: parse
 # ============================================================
+
+def _password(args) -> str | None:
+    """The document password, preferring the environment over argv.
+
+    `--password` puts the secret in the process table for the life of the run
+    and in the operator's shell history for ever. `DOCPARSE_PASSWORD` does
+    neither. The flag stays, because a caller may already depend on it, but it
+    now says what it costs and the environment wins when both are set.
+    """
+    import os
+    from_env = os.environ.get("DOCPARSE_PASSWORD")
+    if from_env:
+        if getattr(args, "password", None):
+            print(f"  {GRAY}Both --password and DOCPARSE_PASSWORD are set; "
+                  f"using the environment.{RESET}", file=sys.stderr)
+        return from_env
+    if getattr(args, "password", None):
+        print(f"  {YELLOW}Warning:{RESET} --password is visible to any local "
+              f"account via `ps` and is written to shell history. Prefer "
+              f"DOCPARSE_PASSWORD.", file=sys.stderr)
+    return getattr(args, "password", None)
+
 
 def cmd_parse(args):
     """Parse one or more documents."""
@@ -773,7 +919,7 @@ def cmd_parse(args):
             try:
                 doc = parse_document(
                     f, pages=args.pages, dpi=args.dpi,
-                    password=args.password, no_cache=args.no_cache,
+                    password=_password(args), no_cache=args.no_cache,
                 )
                 hit = doc.pop("_cache_hit", False)
                 doc.pop("_cached_at", None)
@@ -852,10 +998,14 @@ def cmd_report(args):
         page = cit.get("page", 0)
         if page <= 0:
             continue
-        for f in parse_data.get("files", []):
-            if f.get("file_name") == fname or Path(f.get("file", "")).name == fname:
-                pages_to_screenshot[(fname, page)] = f["file"]
-                break
+        parse_file, ambiguous = _resolve_parse_file(parse_data, fname)
+        if ambiguous:
+            print(f"  {YELLOW}AMBIGUOUS{RESET}  more than one parsed document is "
+                  f"named {fname}; citation p{page} rendered without an image",
+                  file=sys.stderr)
+            continue
+        if parse_file is not None:
+            pages_to_screenshot[(fname, page)] = parse_file["file"]
 
     # Limit screenshots
     max_pages = getattr(args, "max_pages", MAX_REPORT_PAGES)
@@ -867,9 +1017,19 @@ def cmd_report(args):
         )
         pages_to_screenshot = dict(list(pages_to_screenshot.items())[:max_pages])
 
-    # Take screenshots
-    cli = shutil.which("liteparse")
-    parser = LiteParse(cli_path=cli) if cli else LiteParse()
+    # Take screenshots.
+    #
+    # `LiteParse()`, with no `cli_path`. The note at the top of
+    # `parse_document` says plainly that liteparse 2.0 REMOVED that keyword
+    # (the bindings locate the CLI themselves), and this line passed it
+    # whenever the CLI was on PATH — which is the documented, prerequisite
+    # setup. So `report` raised TypeError before taking a single screenshot
+    # while `parse` worked fine, which is the hardest kind of breakage to
+    # place. `shutil.which` is kept as the availability check it now is.
+    if not shutil.which("liteparse"):
+        print(f"{YELLOW}Warning:{RESET} the liteparse CLI is not on PATH; "
+              f"screenshots may fail.", file=sys.stderr)
+    parser = LiteParse()
     page_screenshots: dict[tuple[str, int], bytes] = {}
 
     # Group by file for efficient screenshotting
@@ -926,12 +1086,22 @@ def cmd_report(args):
         if pdf_script.exists():
             pdf_path = html_path.with_suffix(".pdf")
             try:
-                subprocess.run(
+                proc = subprocess.run(
                     [sys.executable, str(pdf_script), str(html_path), str(pdf_path)],
-                    timeout=60, capture_output=True,
+                    timeout=60, capture_output=True, text=True,
                 )
                 if pdf_path.exists():
                     print(f"{GREEN}PDF:{RESET}    {pdf_path}", file=sys.stderr)
+                else:
+                    # There was no `else`, and the return code was never read,
+                    # so a converter that exited non-zero without writing the
+                    # file produced no PDF and no message: the run "completed"
+                    # and the operator had no flag that would have told them.
+                    detail = (proc.stderr or proc.stdout or "").strip()
+                    print(f"{YELLOW}PDF conversion produced no file{RESET} "
+                          f"(html-to-pdf.py exited {proc.returncode})"
+                          + (f": {detail[:300]}" if detail else "."),
+                          file=sys.stderr)
             except (subprocess.TimeoutExpired, OSError) as e:
                 print(f"{YELLOW}PDF conversion skipped:{RESET} {e}", file=sys.stderr)
 
@@ -948,6 +1118,19 @@ def _png_to_jpeg(png_bytes: bytes, quality: int = 85) -> bytes:
         return buf.getvalue()
     except ImportError:
         return png_bytes  # fallback to PNG if Pillow unavailable
+
+
+def _image_mime(data: bytes) -> str:
+    """The MIME type these bytes actually are.
+
+    `_png_to_jpeg` returns the ORIGINAL PNG when Pillow is absent, and the
+    report embedded whatever came back under a hardcoded
+    `data:image/jpeg;base64,` label. Rendering then relied on browser
+    content-sniffing, and a strict consumer — this repo pipes the HTML through
+    `html-to-pdf.py` — can drop the image entirely. Cheap to be honest: the PNG
+    signature is eight fixed bytes.
+    """
+    return "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
 
 
 # ============================================================
@@ -993,7 +1176,12 @@ def cmd_clear_cache(args):
         for entry in CACHE_DIR.glob("*.json"):
             try:
                 data = json.loads(entry.read_text(encoding="utf-8"))
-                if data.get("file") == str(fp) or Path(data.get("file", "")).name == fp.name:
+                # Exact path only. The basename fallback deleted the cache of
+                # every document sharing a filename across directories — asking
+                # to clear `~/drafts/q3.pdf` also cleared `~/contracts/q3.pdf`.
+                # The cost is only recompute, but the deletion was broader than
+                # what was asked for, and the exact match already sufficed.
+                if data.get("file") == str(fp):
                     entry.unlink()
                     removed += 1
             except (json.JSONDecodeError, OSError):
@@ -1033,7 +1221,11 @@ def main():
     sp_parse.add_argument("--files", nargs="+", required=True, help="File paths or directories")
     sp_parse.add_argument("--pages", default=None, help="Page range, e.g. '1-5,10'")
     sp_parse.add_argument("--dpi", type=int, default=DEFAULT_DPI, help="Render DPI (default: 150)")
-    sp_parse.add_argument("--password", default=None, help="Document password")
+    sp_parse.add_argument(
+        "--password", default=None,
+        help="Document password. Prefer DOCPARSE_PASSWORD in the environment: "
+             "an argv element is readable by any local account through `ps` "
+             "for the life of the run, and lands in shell history.")
     sp_parse.add_argument("--no-cache", action="store_true", help="Skip cache")
     sp_parse.add_argument("--output-json", required=True, help="Output JSON path")
 

@@ -71,10 +71,24 @@ _VH_MONEY_CTX_RE = re.compile(
     r"salary|revenue|ARR|cash|equity|fee|fees|deposit|rent|proceeds|pipeline|LTV)\b",
     re.IGNORECASE,
 )
-# A MEMORY.md index hook: "- [Title](file.md) — hook". Pointers under threads/ are
-# skipped (generated pointers to live records, not memory hooks); a bare filename
-# OR a future memory-subdir hook is still scanned (do NOT skip on any '/').
-_VH_HOOK_LINE_RE = re.compile(r"^\s*-\s*\[[^\]]+\]\(([^)]+\.md)\)")
+# One MEMORY.md index hook: "[Title](file.md) — note", up to the next ` · `
+# separator or the end of the line. Pointers under threads/ are skipped (generated
+# pointers to live records, not memory hooks); a bare filename OR a future
+# memory-subdir hook is still scanned (do NOT skip on any '/').
+#
+# This matched from the BULLET until 2026-08-27: `^\s*-\s*\[[^\]]+\]\((...)\)`,
+# which demands the link immediately after the dash. The index is grouped by
+# subject, so a line reads `- Memory: [a](a.md) · [b](b.md)`, and the label
+# between the bullet and the bracket made the whole line fail. Measured against
+# the live index that day: 10 lines matched, out of 216 pointers present. The
+# guard reported zero findings and was believed, because a scan of 5% of a corpus
+# prints the same words as a scan of all of it.
+#
+# Pointer-at-a-time also fixes the misattribution: signals were read from the
+# whole line while the reported target was the FIRST pointer on it, so a price in
+# the fifth hook sent the operator to the first hook's file.
+# `scripts/utils/memory_expiry.py` already solved this shape; this mirrors it.
+_VH_POINTER_RE = re.compile(r"\[[^\]]*?\]\((?P<target>[^)]+)\)[^·\n]*")
 _VH_DESC_RE = re.compile(r"^description:\s*(.*)$")
 
 
@@ -135,12 +149,25 @@ def scan_volatile_hooks(memory_dir) -> dict:
                 "note": f"unreadable MEMORY.md: {exc}",
             }
         for raw in text.splitlines():
-            m = _VH_HOOK_LINE_RE.match(raw)
-            if not m or m.group(1).startswith("threads/"):  # leak-guard: ok (relative prefix match on a MEMORY.md link target, not a path join)
-                continue
-            signals = _volatile_signals(raw)
-            if signals:
-                flagged.append({"target": m.group(1), "line": raw.strip(), "signals": signals})
+            if not raw.lstrip().startswith("-"):
+                continue  # not an index bullet, so it names no memory to open
+            for index, match in enumerate(_VH_POINTER_RE.finditer(raw)):
+                target = match.group("target")
+                if not target.endswith(".md"):
+                    continue
+                if target.startswith("threads/"):  # leak-guard: ok (relative prefix match on a MEMORY.md link target, not a path join)
+                    continue
+                # The group label sits before the first pointer and belongs to it:
+                # "- Mortgage EUR 412,000: [bank](x.md)" and
+                # "- Mortgage: [bank](x.md) - EUR 412,000" are the same claim.
+                segment = raw[:match.end()] if index == 0 else match.group(0)
+                signals = _volatile_signals(segment)
+                if signals:
+                    flagged.append({
+                        "target": target,
+                        "line": segment.strip(),
+                        "signals": signals,
+                    })
 
     flagged_desc: list[dict] = []
     for p in sorted(memory_dir.glob("*.md")):
@@ -260,17 +287,33 @@ def compute_memory_defects(memory_dir: Path) -> dict:
             stale.append((p.name, age))
 
     # Orphans: fact files whose name is not referenced anywhere in MEMORY.md.
+    #
+    # An ABSENT or unreadable index is the state where EVERY fact file is
+    # unreferenced, and the check simply skipped it: the caller received
+    # `orphans: []` under `status: "ok"` and `/memory-hygiene` printed
+    # "0 orphans / none" over an index it had never read. `status` answers a
+    # different question (the DIRECTORY exists), so it could not carry this, and
+    # nothing else in the returned dict did either. `index_readable` is that
+    # missing fact, and the orphan list now names the real state.
     orphans: list[str] = []
-    if memory_file.exists():
+    index_readable = True
+    index_problem = ""
+    content = ""
+    if not memory_file.exists():
+        index_readable = False
+        index_problem = f"{memory_file} does not exist"
+    else:
         try:
             content = memory_file.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            content = ""
-        for p in files:
-            if p.name == "MEMORY.md":
-                continue
-            if p.name not in content:
-                orphans.append(p.name)
+        except OSError as exc:
+            index_readable = False
+            index_problem = f"{memory_file} could not be read: {exc}"
+
+    for p in files:
+        if p.name == "MEMORY.md":
+            continue
+        if p.name not in content:
+            orphans.append(p.name)
 
     return {
         "status": "ok",
@@ -280,6 +323,8 @@ def compute_memory_defects(memory_dir: Path) -> dict:
         "over_budget": lines > MEMORY_BUDGET_LINES,
         "stale": stale,
         "orphans": orphans,
+        "index_readable": index_readable,
+        "index_problem": index_problem,
     }
 
 

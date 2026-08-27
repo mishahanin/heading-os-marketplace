@@ -17,11 +17,15 @@ Public surface:
   optional ``(due: YYYY-MM-DD)`` annotations.
 - ``calculate_health(last_touch_str, cadence_days, yellow_days, red_days, today)``
   - classify a contact as red/yellow/green/gray.
-- ``scan_contacts(config, today=None)`` - scan all contact files and
-  return ``(contacts, tribe_warnings, dangling_refs)``.
+- ``scan_contacts(config, today=None)`` - scan all contact files and return
+  ``(contacts, tribe_warnings, dangling_refs, stages, aliases)``. The summary
+  here said a 3-tuple while the function returned five, so a caller written
+  from this list unpacked wrong; the function's own docstring was correct.
 
 Extracted from scripts/crm-health.py in Phase 6.1 of the 2026-05-12
 workspace performance tune-up. Behaviour is preserved byte-for-byte.
+
+Tests: tests/test_a_queue_that_read_corrupt_as_empty.py
 """
 
 from __future__ import annotations
@@ -46,6 +50,58 @@ from scripts.utils.workspace import (  # noqa: E402
     is_exec_workspace,
 )
 from scripts.utils.markdown import parse_frontmatter_str as _parse_frontmatter  # noqa: E402
+
+
+def try_commit(commit_fn, repo: Path, files, message: str, label: str) -> bool:
+    """Run `commit_fn(repo, files, message)`; return whether it landed.
+
+    Both contact tools move a record across TWO repositories, and both caught a
+    failed commit into a warning and carried on to the next one. So the source
+    repo could commit the removal while the target's copy stayed untracked, and
+    in a fresh clone the contact existed in neither. Returning a BOOLEAN is what
+    lets the caller stop, and lets the final line say "INCOMPLETE" instead of
+    "complete".
+    """
+    import subprocess
+
+    try:
+        commit_fn(repo, files, message)
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode().strip() if getattr(exc, "stderr", None) else exc
+        print(f"Warning: git commit for the {label} repo failed - commit manually.")
+        print(f"  {detail}")
+        return False
+    print(f"Committed to the {label} repo.")
+    return True
+
+
+def stamped_backup_path(source_path: Path, kind: str, today=None) -> Path:
+    """A backup name for `source_path` that never overwrites an earlier one.
+
+    `kind` is the marker in the name: "merged" for `scripts/merge-contacts.py`,
+    "transferred" for `scripts/transfer-contact.py`.
+
+    Both tools move a contact file aside with `Path.rename`, which on POSIX
+    SILENTLY replaces an existing destination. Both used a single fixed name, so
+    running either twice on one contact renamed the new file over the previous
+    backup and destroyed it without a word, while still printing "Source backed
+    up:". `transfer-contact.py` was fixed on its own in July and kept the
+    reasoning in a comment; `merge-contacts.py` carried the same four lines and
+    the same bug until 2026-08-27, because the fix was applied to one copy of
+    duplicated code rather than to a shared helper. This IS that helper.
+
+    The date comes from the configured zone, not UTC: the operator works past
+    midnight local, and a backup filed under yesterday is the small version of
+    the same confusion.
+    """
+    stamp = (today or datetime.now(get_default_tz()).date()).strftime("%Y%m%d")
+    base = f"{source_path.stem}.md.{kind}-{stamp}"
+    backup_path = source_path.with_name(base)
+    suffix = 2
+    while backup_path.exists():
+        backup_path = source_path.with_name(f"{base}-{suffix}")
+        suffix += 1
+    return backup_path
 
 
 # Types excluded from time-based cadence scoring (CEO talks daily)
@@ -156,17 +212,56 @@ def calculate_health(last_touch_str: str, cadence_days: int, yellow_days: int,
         return "green", days_since
 
 
+def _cadence_override(raw, file_name: str) -> int | None:
+    """A contact's explicit `cadence:`, or None when there is not a usable one.
+
+    None means "no override" for both an absent field and an unusable one, so a
+    single bad record falls back to its type default instead of taking the whole
+    scan down with it. The bad value is named on stderr, because silently
+    treating `cadence: 7 days` as absent is the other half of the same defect.
+    """
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        print(f"crm: {file_name} has cadence {text!r}, which is not a whole "
+              f"number of days; using the type default for this contact.",
+              file=sys.stderr)
+        return None
+
+
 def is_radar_frozen(radar_freeze_until, today=None) -> bool:
     """True if a contact is inside an active radar-freeze window.
 
-    Accepts an ISO date (``YYYY-MM-DD``) or full ISO datetime string. Empty or
-    unparseable values mean not frozen. Matches the freeze semantics already
-    honored by cold_sweep_core.route() and crm_next.rank_candidates().
+    THE single implementation. Accepts an ISO date (``YYYY-MM-DD``) or a full
+    ISO datetime string, with or without a ``Z``. An empty value means not
+    frozen; an UNPARSEABLE one means frozen, and says so on stderr.
+
+    Failing closed, and the consolidation, are both from 2026-08-24. This
+    docstring used to end "Matches the freeze semantics already honored by
+    cold_sweep_core.route() and crm_next.rank_candidates()" — an accurate
+    description of THREE separate implementations of one suppression control,
+    every one of them silently fail-open. A typo in `radar_freeze_until` turned
+    a do-not-contact marker into an outreach card in all three, and a fix
+    applied to any one of them left the other two wrong. The other two now call
+    this function.
+
+    Fail closed because the two errors are not symmetric: a contact wrongly
+    held back is a question the operator can ask, and the other direction is a
+    message to someone who was explicitly frozen.
     """
-    if not radar_freeze_until or not str(radar_freeze_until).strip():
+    if radar_freeze_until is None or not str(radar_freeze_until).strip():
         return False
     if today is None:
         today = datetime.now(get_default_tz()).date()
+    if isinstance(today, datetime):
+        today = today.date()
+    # No `.replace("Z", "+00:00")`: `pyproject.toml` sets
+    # `requires-python = ">=3.11"` and `fromisoformat` has parsed the `Z` form
+    # natively since 3.11, so it would be dead code — a mutation deleting it
+    # stayed green because it changes nothing on any supported interpreter.
     raw = str(radar_freeze_until).strip()
     try:
         freeze = datetime.fromisoformat(raw).date()
@@ -174,8 +269,56 @@ def is_radar_frozen(radar_freeze_until, today=None) -> bool:
         try:
             freeze = date.fromisoformat(raw)
         except ValueError:
-            return False
+            print(f"crm: radar_freeze_until {str(radar_freeze_until).strip()!r} "
+                  f"is not an ISO date; treating the contact as frozen.",
+                  file=sys.stderr)
+            return True
     return freeze > today
+
+
+def normalize_name(name: str) -> str:
+    """Normalize a name for comparison. The single definition."""
+    return " ".join(name.lower().strip().split())
+
+
+def contact_identity_key(record: dict) -> str:
+    """"Is this the same person?", answered one way for every tool.
+
+    `entity_ref` when the record carries one, exact normalized NAME otherwise.
+    Company is deliberately absent from the legacy key: company strings differ
+    across exec repos for known dual-owned contacts, so including it breaks
+    matches the name alone makes. `_legacy_fuzzy_key` in `aggregate-crm.py`
+    carries the full rationale and now delegates here.
+
+    `admin-health.py` grouped on FILENAME instead, so a person saved as
+    `jordan-kim.md` by one exec and `kim-jordan.md` by another was shared to
+    the aggregator and not shared to the dashboard, and the two disagreed about
+    a number they both print.
+    """
+    ref = record.get("entity_ref")
+    if ref:
+        return f"entity::{ref}"
+    return f"legacy::name::{normalize_name(record.get('name') or '')}"
+
+
+def is_contact_file(path: Path) -> bool:
+    """One rule for "is this a contact record?", because three copies disagreed.
+
+    `aggregate-crm.py` excluded `readme.md` case-INSENSITIVELY.
+    `admin-health.py` excluded exactly `README.md`, so a `readme.md` in an exec
+    overlay was counted as a contact by the dashboard and not by the
+    aggregator, and the two tools reported different totals for one directory.
+    `_get_contact_files` here excluded nothing at all: a README only stayed out
+    of the results because `scan_contacts` later drops records with no `name`
+    and no `entity_ref`, which is an accident, not a rule -- a README carrying
+    frontmatter would have counted.
+
+    The suffix test is case-insensitive too. A `.MD` file on a case-insensitive
+    filesystem is the same file to everything except this predicate.
+    """
+    return (path.is_file()
+            and path.suffix.lower() == ".md"
+            and path.name.lower() != "readme.md")
 
 
 def _get_contact_files(contacts_dir: Path) -> list:
@@ -185,6 +328,8 @@ def _get_contact_files(contacts_dir: Path) -> list:
     # Personal contacts first (take precedence)
     if contacts_dir.exists():
         for f in sorted(contacts_dir.glob("*.md")):
+            if not is_contact_file(f):
+                continue
             seen.add(f.name)
             files.append(f)
     # Corporate contacts (Tribe members shared from CEO workspace)
@@ -192,7 +337,7 @@ def _get_contact_files(contacts_dir: Path) -> list:
         corp_crm = get_corporate_root() / "crm" / "contacts"
         if corp_crm.exists():
             for f in sorted(corp_crm.glob("*.md")):
-                if f.name not in seen:
+                if is_contact_file(f) and f.name not in seen:
                     files.append(f)
     return files
 
@@ -264,7 +409,15 @@ def scan_contacts(config: dict, today=None, contacts_dir: Path | None = None,
         company = fm.get("company", "")
         rel_type = fm.get("type", "")
         last_touch = fm.get("last_touch", "")
-        cadence_override = fm.get("cadence", "")
+        # Parsed once, here, and tolerantly. `int(cadence_override)` sat inline
+        # in two branches below, so `cadence: 7 days` in ONE contact raised an
+        # uncaught ValueError out of scan_contacts and aborted the whole CRM
+        # scan for every caller -- crm-health, generate-dashboard, aggregate-crm
+        # -- rather than degrading that one record. Every other malformed input
+        # in this module degrades: `calculate_health` returns gray on an
+        # unparseable date, `parse_config` skips a bad row, `parse_commitments`
+        # swallows a bad due date. This is now the same.
+        cadence_override = _cadence_override(fm.get("cadence", ""), file_path.name)
         email = fm.get("email", "")
         radar_freeze_until = fm.get("radar_freeze_until", "")
 
@@ -320,8 +473,8 @@ def scan_contacts(config: dict, today=None, contacts_dir: Path | None = None,
             type_cadence = config[rel_type]["cadence"]
             yellow = config[rel_type]["yellow"]
             red = config[rel_type]["red"]
-            if cadence_override:
-                cadence = int(cadence_override)
+            if cadence_override is not None:
+                cadence = cadence_override
             else:
                 # Apply stage-aware cadence using pipeline_company or company
                 pipeline_co = fm.get("pipeline_company", "") or company
@@ -332,32 +485,12 @@ def scan_contacts(config: dict, today=None, contacts_dir: Path | None = None,
                     aliases=_aliases,
                     type_default=type_cadence,
                 )
-            # Won/Lost -> cadence 0 -> skip time-based tracking (gray)
-            if cadence == 0:
-                commitments = parse_commitments(content)
-                contacts.append({
-                    "name": name,
-                    "company": company,
-                    "email": email,
-                    "type": rel_type,
-                    "stage": stage,
-                    "last_touch": last_touch,
-                    "cadence": 0,
-                    "health": "gray",
-                    "days_since": None,
-                    "commitments": commitments,
-                    "file": file_path.name,
-                    "slug": file_path.stem,
-                    "status": fm.get("status", "active"),
-                    "radar_freeze_until": radar_freeze_until,
-                })
-                continue
             # Recalculate yellow/red proportionally when cadence changed
             if cadence != type_cadence:
                 yellow = max(1, round(yellow * cadence / max(type_cadence, 1)))
                 red = cadence
-        elif cadence_override:
-            cadence = int(cadence_override)
+        elif cadence_override is not None:
+            cadence = cadence_override
             yellow = int(cadence * 0.7)
             red = cadence
         else:
@@ -370,29 +503,25 @@ def scan_contacts(config: dict, today=None, contacts_dir: Path | None = None,
                 aliases=_aliases,
                 type_default=type_cadence,
             )
-            if cadence == 0:
-                commitments = parse_commitments(content)
-                contacts.append({
-                    "name": name,
-                    "company": company,
-                    "email": email,
-                    "type": rel_type,
-                    "stage": stage,
-                    "last_touch": last_touch,
-                    "cadence": 0,
-                    "health": "gray",
-                    "days_since": None,
-                    "commitments": commitments,
-                    "file": file_path.name,
-                    "slug": file_path.stem,
-                    "status": fm.get("status", "active"),
-                    "radar_freeze_until": radar_freeze_until,
-                })
-                continue
             yellow = max(1, round(cadence * 0.7))
             red = cadence
 
-        health, days = calculate_health(last_touch, cadence, yellow, red, today=today)
+        # `cadence: 0` means "no time-based tracking" wherever it came from: a
+        # Won/Lost pipeline stage, or an explicit per-contact override. Two of
+        # the three branches above carried their own copy of this check and
+        # their own copy of the gray record; the explicit-override branch, taken
+        # when the contact's type is absent from the config table, had neither.
+        # It fell through with cadence=0, yellow=0, red=0, and `calculate_health`
+        # returns red for `days_since >= 0` -- a red for a contact touched
+        # yesterday, feeding the radar and /cold-sweep's outreach drafting.
+        #
+        # One check after the branch tree, rather than a third copy inside it:
+        # the two copies are what let the third branch be written without one.
+        if cadence == 0:
+            health, days = "gray", None
+        else:
+            health, days = calculate_health(last_touch, cadence, yellow, red,
+                                            today=today)
         # Radar freeze: a contact inside an active freeze window is parked. Render
         # gray so it leaves the red/yellow radar and the dashboard; downstream
         # cadence + outreach (cold-sweep, crm_next) already honor the same field.
@@ -461,7 +590,16 @@ def load_entity(slug: str, workspace_root: Path | None = None) -> dict | None:
     if not entity_file.exists():
         return None
     text = entity_file.read_text(encoding="utf-8")
-    return parse_frontmatter(text)
+    parsed = parse_frontmatter(text)
+    # `parse_frontmatter` returns `{}` for a file with no frontmatter block, and
+    # `{}` is not None, so `scan_contacts`' dangling-ref branch never fired for
+    # it: the contact was merged to nothing, failed the `if not fm.get("name")`
+    # check a few lines later, and vanished from CRM health, the radar and the
+    # dashboard with no diagnostic anywhere. Only a MISSING file was reported.
+    # A record that exists and says nothing is as dangling as one that is gone.
+    if not parsed:
+        return None
+    return parsed
 
 
 def resolve_entity_ref(relationship_record: dict, workspace_root: Path | None = None) -> dict | None:

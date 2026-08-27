@@ -22,13 +22,17 @@ Also updates TWO pointer surfaces, because they answer different questions:
     the result was a shared summary.md naming session B's archive beside a shared
     prompt.md naming session A's - a mixed state neither writer produced. The
     per-session dirs stayed correct throughout, which is the 2026-08-16 fix
-    doing its job. Left unlocked deliberately: the only shared file with a reader
-    is summary.md (grepped - scripts/next-signal.py reads it, nothing in the
-    engine reads .latest/prompt.md), and that file's single write IS atomic, so
-    the torn pair has no consumer today. A lock here would add a failure mode to
-    a hook whose one rule is that it must never lose a handoff. If a reader of
-    the shared prompt.md is ever added, this becomes a real defect and the pair
-    needs writing under one lock or collapsing into one file.
+    doing its job. The pair IS written under one lock, `.latest/.pointers.lock`,
+    which is bounded and degrades to an unlocked write on expiry (`CP.file_lock`),
+    and `tests/test_checkpoint_state_lock.py::test_the_shared_pointer_pair_cannot_be_torn`
+    holds it.
+
+    This paragraph argued the opposite until 2026-08-25 - that the pair was "left
+    unlocked deliberately" and that "a lock here would add a failure mode" - while
+    the code three hundred lines down already took the lock. A maintainer reading
+    the module docstring first, which is what anyone opening this file does, would
+    have concluded the race was live and unfixed, or removed the lock as the
+    unjustified failure mode this text warned against.
 
 Resets hysteresis state in .claude/state/checkpoint-<session-slug>.json so the
 post-compact session starts fresh, and prunes the per-session artifacts of
@@ -59,7 +63,10 @@ for _candidate in [_BOOT.parent, *_BOOT.parents]:
         break
 sys.path.insert(0, str(WORKSPACE))
 from scripts.utils import checkpoint_paths as CP  # noqa: E402
-from scripts.utils.workspace import get_data_root, get_outputs_dir  # noqa: E402
+from scripts.utils.workspace import (  # noqa: E402
+    data_overlay_present,
+    get_data_root,
+)
 
 # Guarded, and the guard is not defensive habit. This plan's own constraint says
 # a lost handoff is worse than an unredacted one, because the hook runs after the
@@ -93,11 +100,15 @@ except Exception as _exc:  # noqa: BLE001 - never lose the handoff
 # engine-relative: archive_path lives under the data sibling, so relative_to(WORKSPACE)
 # would raise ValueError. The data-path-redirect hook resolves the outputs/... ref.
 _ENGINE_TREE = CP.is_engine_tree(WORKSPACE)
-HANDOFF_DIR = (
-    get_outputs_dir() / "operations" / "handoff-archive"
-    if _ENGINE_TREE
-    else CP.handoff_dir(CP.project_root(), WORKSPACE)
-)
+# ONE call, not a second copy of the branch. This read
+# `get_outputs_dir() / "operations" / "handoff-archive" if _ENGINE_TREE else
+# CP.handoff_dir(...)` until 2026-08-27, which is `handoff_dir()`'s own engine
+# branch written out again -- and that is exactly what made a fix to
+# `handoff_dir()` invisible here. With no private overlay `get_outputs_dir()`
+# falls to `<workspace_root>/examples`, so this line wrote whole session
+# handoffs into the public engine clone. Measured on a worktree with no sibling
+# overlay: five of them, after `handoff_dir()` had already been fixed.
+HANDOFF_DIR = CP.handoff_dir(CP.project_root(), WORKSPACE)
 LATEST_DIR = HANDOFF_DIR / ".latest"
 QUARANTINE_DIR = HANDOFF_DIR / ".quarantine"
 
@@ -187,10 +198,38 @@ def main() -> int:
         )
         return 0
 
-    raw_session_id = payload.get("session_id", "session")
-    raw_trigger = payload.get("trigger", "unknown")
-    raw_transcript_path = payload.get("transcript_path", "")
-    compact_summary = (payload.get("compact_summary") or "").strip()
+    # A payload that is valid JSON but not an object still has `.get` called on
+    # it. `[]`, `"x"` and `3` all parse, then raise an uncaught AttributeError.
+    # Measured 2026-08-23 with `echo '[]' | python <hook>`: exit 1, traceback.
+    # `.claude/hooks/checkpoint-inject.py` fixed this shape on 2026-08-20 and
+    # these were missed. Degrade to the empty dict, which every path below
+    # already handles, rather than dropping the hook's whole job.
+    if not isinstance(payload, dict):
+        print(f"checkpoint-save: payload was {type(payload).__name__}, not an "
+              "object; continuing with defaults", file=sys.stderr)
+        payload = {}
+
+    # Coerce the FIELDS, the way the payload itself is coerced two lines above.
+    # `.strip()` on `payload.get("compact_summary")` sits outside every try block
+    # in this file, so `{"compact_summary": {"a": 1}}` exited 1 with an
+    # AttributeError before anything was written: no archive, no quarantine, no
+    # `.latest` pointer update (so the next session silently resumed from the
+    # PREVIOUS compact's pointer), and no systemMessage - only a traceback on a
+    # stream this file itself notes is read by no one. The hook's one rule is
+    # that a handoff must never be lost.
+    def _text(key: str, default: str = "") -> str:
+        value = payload.get(key, default)
+        if isinstance(value, str):
+            return value
+        if value is not None:
+            print(f"checkpoint-save: {key} arrived as {type(value).__name__}, "
+                  f"not a string; using {default!r}", file=sys.stderr)
+        return default
+
+    raw_session_id = _text("session_id", "session")
+    raw_trigger = _text("trigger", "unknown")
+    raw_transcript_path = _text("transcript_path", "")
+    compact_summary = _text("compact_summary").strip()
 
     # Two clocks, on purpose, per the workspace's datetime split.
     #
@@ -285,11 +324,12 @@ def main() -> int:
     # stranger's handoff into the plugin cache, or worse, into whatever data
     # root the environment happened to carry. Measured on 2026-08-16 against the
     # first built bundle, which wrote into the operator's own live archive.
-    hdir, latest_dir, quarantine_dir = HANDOFF_DIR, LATEST_DIR, QUARANTINE_DIR
-    if not _ENGINE_TREE:
-        hdir = CP.handoff_dir(CP.project_root(payload), WORKSPACE)
-        latest_dir = hdir / ".latest"
-        quarantine_dir = hdir / ".quarantine"
+    # Unconditional since 2026-08-27. With a real overlay `handoff_dir()` ignores
+    # the project and answers the data seam, so recomputing costs nothing there;
+    # without one the project IS the base and the payload names it.
+    hdir = CP.handoff_dir(CP.project_root(payload), WORKSPACE)
+    latest_dir = hdir / ".latest"
+    quarantine_dir = hdir / ".quarantine"
 
     archive_path = hdir / archive_name
     quarantine_path = quarantine_dir / archive_name
@@ -303,7 +343,12 @@ def main() -> int:
     # and the absolute path is what a human recovering the file can paste into a
     # shell that knows nothing about the data root. Two spellings of one written
     # file, stated as such rather than left to be inferred.
-    data_root = get_data_root() if _ENGINE_TREE else CP.project_root(payload)
+    # The refs are relative to whatever root the archive ACTUALLY landed under.
+    # `get_data_root()` is right only when the archive followed the data seam; on
+    # an engine clone with no overlay the archive is project-local and this would
+    # send every ref down `_ref`'s absolute fallback.
+    data_root = (get_data_root() if _ENGINE_TREE and data_overlay_present()
+                 else CP.project_root(payload))
 
     def _ref(path: Path) -> str:
         """Data-root-relative when it can be, absolute when it cannot. Total.
@@ -402,10 +447,25 @@ Repository state is authoritative; this file is supporting context.
             #
             # So the memory is preserved OUTSIDE the tracked tree and the wall
             # is left unarmed. What lands at the normal pointer path is a
-            # POINTER carrying no summary text at all, so the SessionStart
-            # inject still tells the next session where to look and the tracked
-            # tree stays clean. This is an alarm state, not the permanent hiding
-            # that gitignoring the whole archive would have been.
+            # POINTER carrying no summary text at all, and the tracked tree
+            # stays clean. This is an alarm state, not the permanent hiding that
+            # gitignoring the whole archive would have been.
+            #
+            # The SessionStart inject does NOT reach the next session on this
+            # branch, and the sentence above claimed it did until 2026-08-25.
+            # The artifact slug here is the literal "unredacted", so the
+            # per-session pointer pair lands at `.latest/unredacted/`, while
+            # `checkpoint-inject.py` reads only `.latest/<session_slug(payload)>/`
+            # - the slug of the RAW id. The two can never match.
+            #
+            # That is left as it is, deliberately. Pointing the pair at the raw
+            # slug would build a TRACKED directory name out of an id that failed
+            # redaction, which is the one thing this branch exists to prevent;
+            # the state file at line ~636 can use the raw slug precisely because
+            # `.claude/state/` is gitignored, and `.latest/` is not. So the alarm
+            # reaches the operator through the systemMessage and the shared
+            # `.latest/summary.md`, which is what the note 165 lines below has
+            # said all along, and through nothing else.
             write_text_atomic(quarantine_path, archive_md)
     except Exception as exc:  # noqa: BLE001 - the pointers must still be told
         # The MESSAGE stays on stderr for the same reason it does above: it can
