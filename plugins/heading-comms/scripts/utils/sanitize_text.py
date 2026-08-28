@@ -55,6 +55,20 @@ INVISIBLE_CHARS = (
     "⁧"  # Right-to-left isolate (Trojan Source)
     "⁨"  # First strong isolate (Trojan Source)
     "⁩"  # Pop directional isolate (Trojan Source)
+    # The bidi EMBEDDINGS and OVERRIDES, U+202A to U+202E. Written as escapes so
+    # an editor that normalises invisible characters cannot silently drop them,
+    # which is why the isolates above are also duplicated into CHAR_NAMES by
+    # codepoint. This half of the family was absent until 2026-08-28: the table
+    # carried the four isolates, labelled them "(Trojan Source)", and omitted
+    # U+202E RIGHT-TO-LEFT OVERRIDE, the character CVE-2021-42574 is named for.
+    # `scripts/marp_render.py` has stripped all five for its own rendering the
+    # whole time, so the canonical sanitizer every rule points at was the
+    # shorter of the two tables.
+    "\u202a"  # Left-to-right embedding
+    "\u202b"  # Right-to-left embedding
+    "\u202c"  # Pop directional formatting
+    "\u202d"  # Left-to-right override
+    "\u202e"  # Right-to-left override; the Trojan Source vector  # nosec B613
 )
 
 # Characters to replace (not remove)
@@ -93,6 +107,15 @@ CHAR_NAMES.update({
     chr(0x2067): "Right-to-left isolate (Trojan Source)",
     chr(0x2068): "First strong isolate (Trojan Source)",
     chr(0x2069): "Pop directional isolate (Trojan Source)",
+    # The embeddings and overrides. `_name_for` would fall back to the Unicode
+    # database and report "Right-To-Left Override", which is accurate and tells
+    # the reader nothing about why the finding matters. These are the other half
+    # of the same attack, so they carry the same label as the isolates.
+    chr(0x202A): "Left-to-right embedding (Trojan Source)",
+    chr(0x202B): "Right-to-left embedding (Trojan Source)",
+    chr(0x202C): "Pop directional formatting (Trojan Source)",
+    chr(0x202D): "Left-to-right override (Trojan Source)",
+    chr(0x202E): "Right-to-left override (Trojan Source)",
 })
 
 # What `scan` looks for. Derived from what `sanitize` acts on, not hand-listed.
@@ -138,6 +161,25 @@ def sanitize(text: str) -> str:
     text = INVISIBLE_PATTERN.sub("", text)
     text = REPLACE_PATTERN.sub(lambda m: REPLACE_MAP[m.group()], text)
     return text
+
+
+def sanitize_report(text: str) -> Tuple[str, int, int]:
+    """`sanitize(text)` plus what it acted on: (clean, removed, replaced).
+
+    The CLI derived its count as `len(text) - len(clean)`, which sees deletions
+    and nothing else. Every REPLACE_MAP substitution preserves length, so a file
+    whose only contamination was a non-breaking space was rewritten on disk and
+    then reported "already clean" - the one word the hidden-character policy is
+    built around, printed over a file that had just been modified. Measured
+    2026-08-28, and `--scan` on the same bytes reported the character, because
+    SCANNED_CHARS is deliberately INVISIBLE_CHARS | REPLACE_MAP.
+
+    Both counts come from the patterns `sanitize` itself uses, so a character
+    added to either table is counted without anyone remembering to.
+    """
+    removed = len(INVISIBLE_PATTERN.findall(text))
+    replaced = len(REPLACE_PATTERN.findall(text))
+    return sanitize(text), removed, replaced
 
 
 def scan(text: str, filename: str = "stdin", out=None) -> int:
@@ -198,3 +240,25 @@ def scan_file(path) -> Tuple[int, str]:
     buf = io.StringIO()
     count = scan(text, str(path), out=buf)
     return count, buf.getvalue().strip()
+
+
+def word_count(text: str) -> int:
+    """Words as a human counts them in prose. The workspace's one definition.
+
+    A whitespace-separated run counts when it contains at least one letter or
+    digit, so a bare bullet, a lone dash or a `|` table rule does not inflate
+    the figure.
+
+    It lived as `_word_count` inside `scripts/sanitize-text.py`, which is a
+    kebab-case CLI and cannot be imported. So four other counters were written
+    instead, and on one ordinary sentence the five disagreed 11 / 12 / 15 / 15 /
+    17. `.claude/rules/hidden-chars.md` is the rule that settles this and it is
+    explicit that the number "comes from the tool, never from an estimate" - a
+    line that means little while the tools answer differently. This is the tool.
+
+    Prose only. An HTML document must go through
+    `scripts.utils.html_text.strip_html` first, which removes `<style>` and
+    `<script>` BODIES; a bare tag-stripping regex leaves the stylesheet behind
+    and counts it as text.
+    """
+    return sum(1 for tok in text.split() if any(ch.isalnum() for ch in tok))

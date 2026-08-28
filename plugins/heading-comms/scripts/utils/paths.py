@@ -43,6 +43,7 @@ Tests: tests/test_a_data_root_override_that_was_silently_ignored.py, tests/test_
 
 import logging
 import os
+import re
 from pathlib import Path
 
 _log = logging.getLogger(__name__)
@@ -358,6 +359,40 @@ def state_dir(*parts: str) -> Path:
     return target
 
 
+def private_cache_dir(*parts: str) -> Path:
+    """A cache directory for derived PRIVATE content, never inside the demo tree.
+
+    A scraped page and a parsed document are rebuildable, so they are a cache,
+    and they are made of private material, so they belong beside the material
+    they derive from. Two rules, and the second is the one that was missing.
+
+      * With a separate data overlay, the cache goes under the overlay.
+      * Without one, it goes under the WORKSPACE root, never under the data
+        root. With no overlay `get_data_root()` answers
+        `<workspace_root>/examples`, the bundled demo tree, which
+        `scripts/utils/engine_guard.py` treats as a CLOSED MANIFEST: anything
+        untracked under it is a data artifact, and the pre-commit wall and the
+        push wall both refuse. MEASURED 2026-08-28 on a clone with no overlay,
+        one cached scrape wrote `examples/outputs/browser/firecrawl-cache/
+        <key>.json`; no gitignore rule covers it (the rule is root-anchored to
+        `outputs/`), and `scan_engine_repo` flagged it. Every commit and every
+        push then refuses until the operator finds a directory nothing told
+        them about.
+
+    Override the base with WORKSPACE_CACHE_DIR, as with the three helpers
+    around it. Unlike them, this does NOT create the directory: writers already
+    `mkdir` before they write, and a resolver that makes a directory leaves an
+    empty one behind on every clone that merely asked where the cache would be.
+    """
+    base = os.environ.get("WORKSPACE_CACHE_DIR")
+    if base:
+        root = Path(base).expanduser()
+    else:
+        owner = get_data_root() if data_overlay_present() else get_workspace_root()
+        root = owner / ".cache"
+    return root.joinpath(*parts) if parts else root
+
+
 def log_dir(*parts: str) -> Path:
     """Return a workspace log directory, creating it if needed.
 
@@ -375,6 +410,88 @@ def log_dir(*parts: str) -> Path:
 # .env loading (canonical; re-exported by workspace.py)
 # ============================================================
 
+# A POSIX environment-variable name. Deliberately case-permissive: this is a
+# READER, and refusing to see a lowercase key the shell would happily export is
+# a silent miss, not a safety property.
+_ENV_NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def parse_env_line(line: str):
+    """The ``(key, value)`` a single ``.env`` line assigns, or None.
+
+    ONE grammar for the whole workspace. Six places parsed this one file with
+    six hand-rolled rules, and MEASURED 2026-08-28 they disagreed about the same
+    bytes:
+
+        line                load_env      load_gh_token   load_env_key
+        KEY="quoted"        quoted        quoted          "quoted"
+        KEY='quoted'        quoted        quoted          'quoted'
+        <space>KEY=v        v             no match        no match
+        export KEY=v        key was       no match        no match
+                            "export KEY"
+
+    Every consequence is silent. A ``.env`` written in the dotenv-quoted style
+    the loader below documents as supported sends an API key to healthchecks.io
+    WITH its quotes attached. One leading space in front of ``GH_TOKEN=`` makes
+    every push report "no GH_TOKEN in engine .env", which names a cause that is
+    not true. ``export KEY=v`` set a variable literally named ``export KEY`` and
+    left ``KEY`` unset.
+
+    Returns None for a blank line, a comment, a line with no ``=``, and a line
+    whose key is not a valid environment-variable name. None means "this line
+    assigns nothing", which is also exactly what a WRITER needs to know before
+    deciding whether it is looking at the line it came to replace: readers and
+    writers that disagree about that leave duplicate keys behind.
+    """
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    key = key.strip()
+    if key[:6] == "export" and key[6:7] in (" ", "\t"):
+        key = key[6:].strip()
+    if not _ENV_NAME_RE.match(key):
+        return None
+    value = value.strip()
+    # ONE matching pair, never a character-class strip. A chained
+    # `.strip('"').strip("'")` took the trailing quote off `KEY="unbalanced`,
+    # which has no pair at all, and unwrapped `KEY="'x'"` twice down to `x`.
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    return key, value
+
+
+def iter_env_pairs(text: str):
+    """Every ``(key, value)`` assigned in ``.env`` text, in file order."""
+    for line in text.splitlines():
+        pair = parse_env_line(line)
+        if pair is not None:
+            yield pair
+
+
+def read_env_value(env_path, key: str, *, default=None):
+    """The FIRST value ``key`` is assigned in the ``.env`` at *env_path*.
+
+    FIRST, not last, because ``load_env`` uses ``setdefault``: on a file with a
+    duplicate key it is the first line that reaches ``os.environ``, so any other
+    answer would disagree with the environment the same file produces.
+
+    Fail-soft on purpose. A missing, unreadable, or non-UTF-8 file returns
+    *default* rather than raising: ``load_gh_token`` is evaluated eagerly by
+    every ``supervised_push`` caller, and a wall built to fail open must not
+    carry a hard-crash path.
+    """
+    try:
+        text = Path(env_path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        _log.debug(".env unreadable at %s: %s", env_path, exc)
+        return default
+    for found, value in iter_env_pairs(text):
+        if found == key:
+            return value
+    return default
+
+
 def load_env(workspace_root: Path = None) -> None:
     """Load .env variables into os.environ (without overwriting existing vars).
 
@@ -382,22 +499,22 @@ def load_env(workspace_root: Path = None) -> None:
     convention, so KEY="value" and KEY=value both yield 'value'. Without this,
     callers that pass the value straight into libraries expecting bare strings
     (e.g. a URL handed to httpx) hit "missing scheme" errors when the literal
-    '"https://..."' arrives intact.
+    '"https://..."' arrives intact. The grammar is `parse_env_line`, shared with
+    every other reader and writer of this file.
+
+    The read is whole-file rather than line-by-line so a non-UTF-8 byte raises
+    before any variable is set. The streaming version decoded a read buffer at a
+    time, so on a file that fits in one buffer it also raised before setting
+    anything; past that it did not. MEASURED 2026-08-28 with a bad byte at the
+    end: a 1711-byte file set 0 variables before raising, an 18911-byte file set
+    1749, leaving the process half-populated with no record of where it stopped.
     """
     root = workspace_root or get_workspace_root()
     env_path = root / ".env"
     if not env_path.exists():
         return
-    with open(env_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-                value = value[1:-1]
-            os.environ.setdefault(key.strip(), value)
+    for key, value in iter_env_pairs(env_path.read_text(encoding="utf-8")):
+        os.environ.setdefault(key, value)
 
 
 # ============================================================

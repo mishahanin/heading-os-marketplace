@@ -37,7 +37,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from scripts.utils.engine_guard import scan_engine_repo
 from scripts.utils.supervise import run_supervised
-from scripts.utils.workspace import get_data_root, get_workspace_root
+from scripts.utils.workspace import (
+    get_data_root,
+    get_workspace_root,
+    read_env_value,
+)
 
 # Echoes the token from the child env (NOT argv) into git's credential protocol.
 _CRED_HELPER = '!f(){ echo username=x-access-token; echo "password=$GH_PUSH_TOKEN"; }; f'
@@ -404,22 +408,58 @@ def remote_objection(repo, *, token: Optional[str] = None,
 
 
 def load_gh_token() -> Optional[str]:
-    """Return GH_TOKEN from the engine ``.env`` (the git pushgh source of truth)."""
-    env_path = get_workspace_root() / ".env"
+    """Return GH_TOKEN from the engine ``.env`` (the git pushgh source of truth).
+
+    Parsing is `paths.parse_env_line`, the one grammar every reader and writer
+    of this file now shares. This function used to match with
+    `line.startswith("GH_TOKEN=")`, so a single leading space in front of the
+    key made the token invisible to it while `load_env` read it perfectly well:
+    safe-push then reported "no GH_TOKEN in engine .env" and named a cause that
+    was not true. It also unquoted with a chained `.strip('"').strip("'")`,
+    which is a character-class strip, not a pair strip.
+
+    `read_env_value` is fail-soft, which this caller requires: a wall built to
+    fail open must not carry a hard-crash path, and this expression is evaluated
+    eagerly by every `supervised_push` caller, including `offboard-exec` and
+    `create-data-repo`. A single non-UTF-8 byte in `.env` must not crash them.
+    """
+    return read_env_value(get_workspace_root() / ".env", "GH_TOKEN")
+
+
+def enclosing_repo_root(path) -> Optional[Path]:
+    """The work-tree root of the repository containing ``path``, or None.
+
+    None means "could not establish one" and NEVER "the path is a root": not a
+    repository at all, a bare repository (which has no work tree), or git
+    unavailable. Callers must treat None as unknown, so this can only ever
+    REFUSE on positive evidence.
+
+    Every git call in this module is `git -C <path> ...`, and git walks UP from
+    that path to the enclosing repository. Nothing here ever checked that the
+    path it was handed was a root. MEASURED 2026-08-28 against a bare engine
+    clone: `ahead_behind` answered `(0, 20)` for the repo root, for
+    `<root>/examples`, and for `<root>/scripts/utils` alike - the same three
+    numbers, because all three questions were about the enclosing repository.
+    A linked git worktree IS its own toplevel, so this does not object to one.
+    """
     try:
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            if line.startswith("GH_TOKEN="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except (OSError, UnicodeDecodeError) as exc:
-        # A wall built to fail open must not carry a hard-crash path. This
-        # function's own token expression is evaluated eagerly by every
-        # `supervised_push` caller, including `offboard-exec` and
-        # `create-data-repo`, none of which used to reach this read, and Check A
-        # never uses the token anyway, so a single non-UTF-8 byte in `.env` must
-        # not crash them.
-        logger.debug("gh token unreadable: %s", exc)
+        out = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.debug("repo root unreadable for %s: %s", path, exc)
         return None
-    return None
+    if out.returncode != 0:
+        return None
+    top = out.stdout.strip()
+    if not top:
+        return None
+    try:
+        return Path(top).resolve()
+    except OSError as exc:
+        logger.debug("repo root unresolvable for %s: %s", path, exc)
+        return None
 
 
 def current_branch(repo) -> Optional[str]:
@@ -473,6 +513,35 @@ def supervised_push(
     postcondition_failed). The caller decides what a non-"ok" state means.
     """
     repo = Path(repo)
+
+    # Is this path the repository it claims to be? `git -C <path>` walks UP to
+    # the enclosing repository, so a SUBDIRECTORY pushes its parent and the
+    # ahead/behind postcondition then verifies the PARENT's ref: the run reports
+    # a verified push of a repository it was never given. Six callers reach this
+    # function, each passing a path it believes is a root, and none of them
+    # checked. Refusing here covers all six, which is what "universal
+    # chokepoint" below is supposed to mean.
+    #
+    # Only ever refuses on positive evidence. `enclosing_repo_root` returns None
+    # for a bare repository and for a path that is no repository at all, and
+    # None is treated as unknown so git still gets to fail on its own. A linked
+    # git worktree is its own toplevel and passes.
+    root = enclosing_repo_root(repo)
+    if root is not None and root != repo.resolve():
+        return {
+            "state": "failed",
+            "reason": (
+                f"{repo} is not a git repository root: it sits inside the "
+                f"repository at {root}. Pushing from here would push "
+                f"'{root.name}', and the ahead/behind postcondition would "
+                f"verify '{root.name}' too, so this run would report a "
+                f"verified push of a repository it was never given."
+            ),
+            "elapsed_s": 0.0,
+            "exit_code": None,
+            "tail": "",
+            "flagged": [],
+        }
 
     # Engine/data leak wall (universal chokepoint). EVERY engine push -- push-all,
     # safe-push, or any future caller -- routes through here, so a private/corporate-

@@ -422,8 +422,41 @@ FALSE_AGENCY_RE = re.compile(
 # Title Case heading detection (line starting with # and most words capitalised)
 TITLE_CASE_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 
-# Sentence boundary - simple heuristic, not perfect but adequate
-SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+# Sentence boundary - still a heuristic, but no longer one that reads letter case.
+#
+# It was `(?<=[.!?])\s+(?=[A-Z])`, which split only before a capital. A sentence
+# opening with a command name, a path, a slash command, or a word left lowercase
+# by `strip_markdown_noise` deleting its inline code span was therefore MERGED
+# into its predecessor. Measured 2026-08-28: the same three sentences count as 3
+# when capitalised and as 1 when not.
+#
+# The direction is the harmful one. Merging makes measured sentences longer, so
+# the over-fragmentation check stops firing, and it drops the sentence count, so
+# `check_burstiness` skips the paragraph entirely on `len(sentences) < 3`. A
+# paragraph the audit could not measure was reported as a paragraph with no
+# findings.
+#
+# The capital was doing two jobs: it marked a sentence start, and it happened to
+# suppress a split inside "3.5" and after "e.g.". Only the first job was
+# intended, so the two suppressions are now written down instead of implied.
+# `\s+` already handles the decimal - there is no space inside `3.5`.
+_ABBREVIATIONS = ("etc", "cf", "vs", "al", "approx", "fig", "dr", "mr", "mrs",
+                  "ms", "prof", "jr", "sr")
+#
+# The case-insensitivity is SCOPED to the abbreviation guards with `(?i:...)`,
+# not set as a flag on the whole pattern. A flag would also apply to the
+# lookahead, making `(?=\S)` and `(?=[A-Z])` the same expression - so the
+# capital requirement would be dead without saying so, and a later edit
+# reinstating it would change nothing while looking like it changed everything.
+# Caught by mutation: restoring `(?=[A-Z])` under the flag was not detectable.
+SENTENCE_BOUNDARY = re.compile(
+    r"(?<=[.!?])"
+    # `e.g.`, `i.e.`, `a.m.`, `U.S.` - a single letter between two dots is never
+    # the end of a sentence. One rule, rather than one entry per abbreviation.
+    r"(?<!\.\w\.)"
+    + "".join(rf"(?<!(?i:\b{a}\.))" for a in _ABBREVIATIONS)
+    + r"\s+(?=\S)"
+)
 
 # Paragraph boundary
 PARAGRAPH_BOUNDARY = re.compile(r"\n\s*\n")
@@ -1169,11 +1202,19 @@ def print_report(result, source):
     f = result["findings"]
     if not f:
         print(f"\n  {GREEN}{source}: clean - no humanisation findings.{RESET}")
-        print(f"  Word count: {s['word_count']}. Paragraphs: {s['paragraph_count']}.")
+        print(f"  Rhythm words: {s['word_count']}. "
+              f"Paragraphs: {s['paragraph_count']}.")
+        print(f"  {GRAY}(This tool's own token count, used for its sentence and "
+              f"paragraph thresholds. The deliverable's word count comes from "
+              f"`sanitize-text.py --scan`.){RESET}")
         return
 
     print(f"\n  {BOLD}{source}: {s['errors']} error(s), {s['warnings']} warning(s).{RESET}")
-    print(f"  Word count: {s['word_count']}. Paragraphs: {s['paragraph_count']}.\n")
+    print(f"  Rhythm words: {s['word_count']}. "
+          f"Paragraphs: {s['paragraph_count']}.")
+    print(f"  {GRAY}(This tool's own token count, used for its sentence and "
+          f"paragraph thresholds. The deliverable's word count comes from "
+          f"`sanitize-text.py --scan`.){RESET}\n")
 
     errors = [x for x in f if x.get("severity") == "error"]
     warnings = [x for x in f if x.get("severity") == "warning"]

@@ -36,12 +36,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.utils.colors import BOLD, CYAN, GREEN, GRAY, RED, RESET, YELLOW
-from scripts.utils.workspace import get_workspace_root, get_outputs_dir, get_default_tz
+from scripts.utils.workspace import (
+    get_default_tz,
+    get_outputs_dir,
+    get_workspace_root,
+    private_cache_dir,
+)
 
 WORKSPACE = get_workspace_root()
-CACHE_DIR = WORKSPACE / ".cache" / "docparse"
 DEFAULT_DPI = 150
-DEFAULT_OUTPUT_DIR = get_outputs_dir() / "intel" / "docparse"
 CACHE_TTL_HOURS = 168  # 7 days
 
 # One constant, because three copies disagreed. Until 2026-08-23 the installer
@@ -98,9 +101,36 @@ def _cache_key(
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def cache_dir() -> Path:
+    """Where parsed documents are cached.
+
+    A cache entry here holds the full extracted TEXT of the document that was
+    parsed, so it is private material even though it is rebuildable. It used to
+    be `<workspace_root>/.cache/docparse`, which is INSIDE the engine clone, on
+    a workspace whose whole premise is that the engine carries code and nothing
+    else. It is gitignored, so it could never be committed and this was never a
+    leak; it was simply on the wrong side of the seam, in a tree no content wall
+    looks at (`repo_carried_paths` passes `--exclude-standard`, and rightly so).
+    MEASURED 2026-08-28 on the operator's own machine: five parsed documents.
+
+    `private_cache_dir` puts it under the data overlay when there is one, and
+    leaves it under the workspace root when there is not, which is where a
+    standalone clone's own documents belong. Both destinations are already
+    covered by their repository's gitignore, so this needs no new rule.
+
+    A FUNCTION, not the module constant it replaces. The constant resolved at
+    import time, which would have made `import scripts.docparse` raise on a
+    stale HEADING_OS_DATA. Deleting the name rather than reassigning it is also
+    deliberate: a test still doing `monkeypatch.setattr(dp, "CACHE_DIR", ...)`
+    now fails loudly instead of binding nothing and quietly writing into the
+    operator's live cache.
+    """
+    return private_cache_dir("docparse")
+
+
 def _cache_get(key: str) -> dict | None:
     """Return cached parse result if exists and not expired."""
-    cache_file = CACHE_DIR / f"{key}.json"
+    cache_file = cache_dir() / f"{key}.json"
     if not cache_file.exists():
         return None
     try:
@@ -127,9 +157,10 @@ def _cache_get(key: str) -> dict | None:
 
 def _cache_put(key: str, data: dict) -> None:
     """Write parse result to cache."""
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cdir = cache_dir()
+    cdir.mkdir(parents=True, exist_ok=True)
     data["_cached_at"] = datetime.now(timezone.utc).isoformat()
-    (CACHE_DIR / f"{key}.json").write_text(
+    (cdir / f"{key}.json").write_text(
         json.dumps(data, ensure_ascii=False), encoding="utf-8"
     )
 
@@ -420,14 +451,40 @@ def _generate_report_html(
     page_screenshots: dict,  # {(file, page_num): bytes}
     parse_data: dict,        # full parse JSON
     title: str = "Document Analysis Report",
+    capped_pages: int = 0,   # cited pages dropped by --max-pages, 0 if none
 ) -> str:
     """Generate self-contained 31C-branded HTML report with visual citations."""
     from scripts.utils.image import load_logo_base64
 
     logo_b64 = load_logo_base64()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    files_str = ", ".join(set(c.get("file", "?") for c in citations))
-    pages_cited = len(page_screenshots)
+
+    # The parse this report is built on may have been partial. `cmd_parse` now
+    # records every document it could not read under `failures`, and this is
+    # where that reaches the reader: a report over three of five documents used
+    # to look exactly like a report over all five, and the answer above it was
+    # written against the three.
+    parse_failures = parse_data.get("failures") or []
+    parse_failure_note = ""
+    if parse_failures:
+        _names = ", ".join(sorted(html.escape(Path(f.get("file", "?")).name)
+                                  for f in parse_failures))
+        parse_failure_note = f'''
+    <div class="cite-caveat">The parse behind this report did not cover every
+    document it was given. {len(parse_failures)} failed and are absent from the
+    evidence below: {_names}.</div>'''
+    # `sorted`, not bare `set`: the header is part of a document the operator
+    # keeps, and two runs over identical input printed the file names in
+    # different orders.
+    files_str = ", ".join(sorted({c.get("file", "?") for c in citations}))
+    # Counted from the CITATIONS, which is what the label says. It was
+    # `len(page_screenshots)`, the number of screenshots the run managed to
+    # take: a screenshot that failed (`cmd_report` logs the error and carries
+    # on) or two documents sharing a basename (that dict is keyed by basename)
+    # both made the header print fewer "pages cited" than the cards below it
+    # showed. A screenshot count under a citation label is a measurement
+    # answering a different question than its own caption.
+    pages_cited = len({(c.get("file", "?"), c.get("page", 0)) for c in citations})
     answer_html = _markdown_to_html(answer_md)
 
     # Build citation cards HTML
@@ -438,10 +495,31 @@ def _generate_report_html(
         page_num = cit.get("page", 0)
         quote_text = cit.get("quote", "")
         relevance = cit.get("relevance", "")
-        screenshot_key = (file_name, page_num)
+        # Resolve the file first, so the page and the screenshot are looked up
+        # against the SAME document. `_find_page_in_parse` collapses "no such
+        # document" and "no such page" into one None, and the card has to tell
+        # a reader which of the two happened.
+        parse_file, ambiguous = _resolve_parse_file(parse_data, file_name)
+        page_data = None
+        if parse_file is not None:
+            for _p in parse_file.get("pages", []):
+                if _p.get("page_num") == page_num:
+                    page_data = _p
+                    break
 
-        # Find bounding boxes for this quote
-        page_data, ambiguous = _find_page_in_parse(parse_data, file_name, page_num)
+        # `cmd_report` keys `page_screenshots` by BASENAME, so the key is built
+        # from the RESOLVED file and never from the citation's raw string.
+        # Citing the full path is the remedy the ambiguity note below tells the
+        # operator to use, and it was the one spelling that matched no
+        # screenshot: the fix for the ambiguous name landed in
+        # `_resolve_parse_file` and never reached this lookup, so following the
+        # advice silently cost the reader the page image and the highlight.
+        if parse_file is not None:
+            shot_name = parse_file.get("file_name") or Path(parse_file.get("file", "")).name
+        else:
+            shot_name = Path(file_name).name
+        screenshot_key = (shot_name, page_num)
+
         dpi = DEFAULT_DPI
         if page_data:
             boxes = find_boxes_for_quote(page_data.get("text_items", []), quote_text, dpi)
@@ -454,7 +532,12 @@ def _generate_report_html(
 
         # Screenshot image. Withheld when the name resolves to more than one
         # document: showing SOME page under an unresolved name is the defect.
-        img_bytes = None if ambiguous else page_screenshots.get(screenshot_key)
+        # Withheld for the same reason when the parse data holds no such page:
+        # the only page size available then is the invented 800x600 above, so
+        # any highlight drawn over the image would be in a made-up coordinate
+        # space.
+        img_bytes = (None if (ambiguous or page_data is None)
+                     else page_screenshots.get(screenshot_key))
         if img_bytes:
             img_b64 = base64.b64encode(img_bytes).decode("ascii")
             img_src = f"data:{_image_mime(img_bytes)};base64,{img_b64}"
@@ -470,11 +553,54 @@ def _generate_report_html(
                 f'fill="rgba(91,95,255,0.2)" stroke="#5B5FFF" stroke-width="2"/>\n'
             )
 
-        ambiguity_note = "" if not ambiguous else (
-            f'\n      <div class="cite-ambiguous">More than one parsed document '
-            f'is named {html.escape(file_name)}. This citation does not say '
-            f'which, so no page image or highlight is shown. Cite the full path '
-            f'to resolve it.</div>')
+        # One note channel, every degraded state. There used to be exactly one
+        # state that said anything -- the ambiguous name -- and four that did
+        # not: a document absent from the parse data, a page absent from it, a
+        # quote the matcher PROVED is not in the page's extracted text, and a
+        # page whose screenshot was never captured. All four rendered as an
+        # ordinary, confident card. The worst of them is the quote: the report
+        # exists to show a reader WHERE a document says something, and the one
+        # case where the tool established that it does not say it there was the
+        # case it kept to itself.
+        #
+        # A list, not a single message. The states are independent, and a
+        # second problem hidden behind the first is the same defect again.
+        notes = []
+        if ambiguous:
+            notes.append(
+                f'More than one parsed document is named {html.escape(file_name)}. '
+                f'This citation does not say which, so no page image or highlight '
+                f'is shown. Cite the full path to resolve it.')
+        elif parse_file is None:
+            notes.append(
+                f'No parsed document named {html.escape(file_name)} is in this '
+                f'report, so the quote below was never checked against a source '
+                f'and no page image is shown.')
+        elif page_data is None:
+            notes.append(
+                f'Page {html.escape(str(page_num))} is not among the parsed pages '
+                f'of {html.escape(file_name)}, so the quote below was never '
+                f'checked against a source and no page image is shown.')
+        else:
+            if not quote_text.strip():
+                notes.append(
+                    'This citation carries no quote, so there is nothing to '
+                    'locate on the page.')
+            elif not boxes:
+                notes.append(
+                    f'The quote below was NOT found in the extracted text of page '
+                    f'{html.escape(str(page_num))} of {html.escape(file_name)}. '
+                    f'The page is shown, but nothing on it is highlighted because '
+                    f'the quote could not be located.')
+            if img_bytes is None:
+                notes.append(
+                    f'No page image was captured for page '
+                    f'{html.escape(str(page_num))} of {html.escape(file_name)}.')
+
+        ambiguity_note = "".join(
+            f'\n      <div class="{"cite-ambiguous" if ambiguous else "cite-caveat"}">'
+            f'{n}</div>'
+            for n in notes)
 
         card = f"""
     <section class="citation-card" id="cite-{html.escape(str(cit_id), quote=True)}">
@@ -616,6 +742,18 @@ def _generate_report_html(
     color: var(--text-muted);
     font-size: 0.85rem;
   }}
+  /* Same look, separate rule. Written out rather than added to the selector
+     above, because `test_the_ambiguous_style_is_defined` matches the literal
+     `.cite-ambiguous {{`, and a grouped selector would silently stop matching
+     it while the style still worked. */
+  .cite-caveat {{
+    margin: 0 1.25rem 0.75rem;
+    padding: 0.6rem 0.85rem;
+    border-left: 3px solid #F5922B;
+    background: rgba(245,146,43,0.08);
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }}
 
   .card-body {{
     display: grid;
@@ -690,7 +828,10 @@ def _generate_report_html(
   <header>
     {"" if not logo_b64 else f'<img src="{logo_b64}" class="logo" alt="31C">'}
     <h1>{html.escape(title)}</h1>
-    <div class="meta">{html.escape(files_str)} | {pages_cited} pages cited | {len(citations)} citations | {now}</div>
+    <div class="meta">{html.escape(files_str)} | {pages_cited} pages cited | {len(citations)} citations | {now}</div>{"" if not capped_pages else f'''
+    <div class="cite-caveat">This report was limited to a maximum number of
+    cited pages, so {capped_pages} cited page(s) below carry no page image. The
+    limit is set by --max-pages.</div>'''}{parse_failure_note}
   </header>
 
   <div class="question-box">
@@ -814,17 +955,41 @@ def _setup_check() -> bool:
         print(f"         Install: npm install -g @llamaindex/liteparse")
         all_ok = False
 
-    # Python package
+    # Python package. The version is checked, not merely the import, because
+    # `setup --install` pins `liteparse=={LITEPARSE_VERSION}` and a drifted
+    # install is exactly what this command exists to catch. MEASURED
+    # 2026-08-28 on the operator's machine: LITEPARSE_VERSION is "2.0.0", the
+    # installed package is 2.9.0, and this printed "All prerequisites met".
+    version_unknown = False
     try:
         import liteparse
-        print(f"  {GREEN}OK{RESET}  liteparse Python package installed")
+        installed = getattr(liteparse, "__version__", None)
+        if installed is None:
+            print(f"  {YELLOW}WARN{RESET}  liteparse installed, version not "
+                  f"reported by the package (expected {LITEPARSE_VERSION})")
+            version_unknown = True
+        elif installed != LITEPARSE_VERSION:
+            print(f"  {YELLOW}WARN{RESET}  liteparse {installed} installed, "
+                  f"this tool is written against {LITEPARSE_VERSION}")
+            version_unknown = True
+        else:
+            print(f"  {GREEN}OK{RESET}  liteparse {installed}")
     except ImportError:
         print(f"  {RED}FAIL{RESET}  liteparse Python package not installed")
         print(f"         Install: pip install liteparse=={LITEPARSE_VERSION}")
         all_ok = False
 
-    if all_ok:
-        print(f"\n{GREEN}All prerequisites met.{RESET}")
+    # What the sentence may claim is what the three checks above established:
+    # that node, the CLI and the package are PRESENT. It said "All
+    # prerequisites met", which reads as a verdict on the whole setup, over a
+    # method that never compared a single version.
+    if all_ok and not version_unknown:
+        print(f"\n{GREEN}Node.js, the LiteParse CLI and the Python package are "
+              f"present, at the versions this tool expects.{RESET}")
+    elif all_ok:
+        print(f"\n{YELLOW}Node.js, the LiteParse CLI and the Python package are "
+              f"present. The package version was not confirmed as "
+              f"{LITEPARSE_VERSION}; see the WARN above.{RESET}")
     else:
         print(f"\n{RED}Some prerequisites missing. Run: python scripts/docparse.py setup --install{RESET}")
 
@@ -896,7 +1061,8 @@ def _password(args) -> str | None:
 
 def cmd_parse(args):
     """Parse one or more documents."""
-    results = {"files": [], "summary": {}}
+    results = {"files": [], "failures": [], "summary": {}}
+    failures = results["failures"]
     t0 = time.time()
     cache_hits = 0
 
@@ -904,6 +1070,9 @@ def cmd_parse(args):
         fp = Path(file_str).resolve()
         if not fp.exists():
             print(f"  {RED}SKIP{RESET}  {file_str} (not found)", file=sys.stderr)
+            # A path the operator NAMED and that does not exist is the loudest
+            # failure of the three, and it was the one nothing recorded.
+            failures.append({"file": str(fp), "error": "not found"})
             continue
 
         # Auto-discover if directory
@@ -935,12 +1104,24 @@ def cmd_parse(args):
                 )
             except FileNotFoundError:
                 print(f"  {RED}SKIP{RESET}  {f.name} (not found)", file=sys.stderr)
+                failures.append({"file": str(f), "error": "not found"})
             except Exception as e:
                 print(f"  {RED}ERROR{RESET}  {f.name}: {e}", file=sys.stderr)
+                failures.append({"file": str(f), "error": f"{type(e).__name__}: {e}"})
 
     elapsed = time.time() - t0
+    results["failures"] = failures
     results["summary"] = {
         "total_files": len(results["files"]),
+        # `total_files` counts successes, and it was the ONLY count written.
+        # MEASURED on five documents of which two raised: the archived JSON
+        # said `total_files: 3`, carried no record of the other two, and the
+        # errors went to stderr where they scroll away. `cmd_report` then read
+        # that file and had no way to know the sweep was partial, so a report
+        # built over three fifths of a corpus looked exactly like one built
+        # over all of it.
+        "total_failed": len(failures),
+        "total_requested": len(results["files"]) + len(failures),
         "total_pages": sum(len(f.get("pages", [])) for f in results["files"]),
         "cache_hits": cache_hits,
         "elapsed_seconds": round(elapsed, 2),
@@ -951,12 +1132,23 @@ def cmd_parse(args):
     output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
     s = results["summary"]
+    # `N files` alone reads as "N is what there was". Say what was asked for
+    # whenever the two numbers differ, so a partial sweep cannot be mistaken
+    # for a complete one at a glance.
+    scope = (f"{s['total_files']} of {s['total_requested']} files"
+             if s["total_failed"] else f"{s['total_files']} files")
     print(
-        f"\n{BOLD}{s['total_files']} files, {s['total_pages']} pages, "
+        f"\n{BOLD}{scope}, {s['total_pages']} pages, "
         f"{s['cache_hits']} cache hits, {s['elapsed_seconds']}s{RESET}",
         file=sys.stderr,
     )
     print(f"Output: {output_path}", file=sys.stderr)
+
+    if s["total_failed"]:
+        print(f"{RED}{s['total_failed']} file(s) failed{RESET} and are recorded "
+              f"under `failures` in {output_path.name}:", file=sys.stderr)
+        for fail in results["failures"]:
+            print(f"  {Path(fail['file']).name}: {fail['error']}", file=sys.stderr)
 
     if s["total_files"] == 0:
         print(f"\n{RED}Error: No files were successfully parsed.{RESET}", file=sys.stderr)
@@ -1009,7 +1201,14 @@ def cmd_report(args):
 
     # Limit screenshots
     max_pages = getattr(args, "max_pages", MAX_REPORT_PAGES)
+    # The count travels into the report. It used to be a stderr warning and
+    # nothing else, so the HTML the operator keeps and forwards recorded no
+    # trace of the cut: a reader opening it later saw citation cards with no
+    # page image and had no way to learn that the tool chose not to capture
+    # them rather than failed to.
+    capped_pages = 0
     if len(pages_to_screenshot) > max_pages:
+        capped_pages = len(pages_to_screenshot) - max_pages
         print(
             f"{YELLOW}Warning:{RESET} Limiting to {max_pages} cited pages "
             f"(requested {len(pages_to_screenshot)})",
@@ -1064,6 +1263,7 @@ def cmd_report(args):
         page_screenshots=page_screenshots,
         parse_data=parse_data,
         title=args.title,
+        capped_pages=capped_pages,
     )
 
     # Write output
@@ -1071,7 +1271,13 @@ def cmd_report(args):
         output_dir = Path(args.output_dir)
     else:
         date_str = datetime.now(get_default_tz()).strftime("%Y-%m-%d")
-        output_dir = DEFAULT_OUTPUT_DIR / date_str
+        # Resolved HERE, not at import. As a module constant this called
+        # `get_outputs_dir()` the moment anything imported docparse, so a
+        # HEADING_OS_DATA naming a directory that had since moved raised
+        # DataRootError out of the import itself: no argparse, no usage line, a
+        # traceback from `--help`. Only the `report` subcommand needs it, and
+        # only when `--output-dir` was not given.
+        output_dir = get_outputs_dir() / "intel" / "docparse" / date_str
 
     output_dir.mkdir(parents=True, exist_ok=True)
     html_path = output_dir / "docparse-report.html"
@@ -1139,11 +1345,12 @@ def _image_mime(data: bytes) -> str:
 
 def cmd_status(_args):
     """Show cache statistics."""
-    if not CACHE_DIR.exists():
+    cdir = cache_dir()
+    if not cdir.exists():
         print("Cache directory does not exist yet (no documents parsed).")
         return
 
-    entries = list(CACHE_DIR.glob("*.json"))
+    entries = list(cdir.glob("*.json"))
     if not entries:
         print("Cache is empty.")
         return
@@ -1152,7 +1359,7 @@ def cmd_status(_args):
     oldest = min(entries, key=lambda f: f.stat().st_mtime)
     newest = max(entries, key=lambda f: f.stat().st_mtime)
 
-    print(f"  Cache dir:   {CACHE_DIR}")
+    print(f"  Cache dir:   {cdir}")
     print(f"  Entries:     {len(entries)}")
     print(f"  Total size:  {total_size:,} bytes ({total_size / 1024:.1f} KB)")
     print(f"  Oldest:      {datetime.fromtimestamp(oldest.stat().st_mtime, tz=get_default_tz()).isoformat()}")
@@ -1165,7 +1372,8 @@ def cmd_status(_args):
 
 def cmd_clear_cache(args):
     """Clear parse cache."""
-    if not CACHE_DIR.exists():
+    cdir = cache_dir()
+    if not cdir.exists():
         print("Cache is already empty.")
         return
 
@@ -1173,31 +1381,75 @@ def cmd_clear_cache(args):
         fp = Path(args.file).resolve()
         # Try to find matching cache entries by reading them
         removed = 0
-        for entry in CACHE_DIR.glob("*.json"):
+        unreadable = []
+        undeletable = []
+        for entry in cdir.glob("*.json"):
             try:
                 data = json.loads(entry.read_text(encoding="utf-8"))
-                # Exact path only. The basename fallback deleted the cache of
-                # every document sharing a filename across directories — asking
-                # to clear `~/drafts/q3.pdf` also cleared `~/contracts/q3.pdf`.
-                # The cost is only recompute, but the deletion was broader than
-                # what was asked for, and the exact match already sufficed.
-                if data.get("file") == str(fp):
-                    entry.unlink()
-                    removed += 1
-            except (json.JSONDecodeError, OSError):
-                pass
+            except (json.JSONDecodeError, OSError) as e:
+                # This used to be `pass`, under a handler that also covered the
+                # unlink below. An entry this loop cannot read is an entry it
+                # cannot rule out: it may be the cache of exactly the file the
+                # operator asked to clear, and the count printed afterwards
+                # said nothing about it either way.
+                unreadable.append((entry.name, str(e)))
+                continue
+            # Exact path only. The basename fallback deleted the cache of
+            # every document sharing a filename across directories — asking
+            # to clear `~/drafts/q3.pdf` also cleared `~/contracts/q3.pdf`.
+            # The cost is only recompute, but the deletion was broader than
+            # what was asked for, and the exact match already sufficed.
+            if data.get("file") != str(fp):
+                continue
+            try:
+                entry.unlink()
+            except OSError as e:
+                # The sharper half of the same swallow. MEASURED: one matching
+                # entry that raises EACCES on unlink printed "Removed 0 cache
+                # entries for q3.pdf" and stopped there, which an operator
+                # reads as "there was no cache for that file" — the exact
+                # opposite of what happened. The entry is still on disk and the
+                # next parse still reads it.
+                undeletable.append((entry.name, str(e)))
+                continue
+            removed += 1
         print(f"Removed {removed} cache entries for {fp.name}")
+        for name, err in unreadable:
+            print(f"{YELLOW}Skipped{RESET} {name}: unreadable ({err}). "
+                  f"It may or may not belong to {fp.name}.", file=sys.stderr)
+        for name, err in undeletable:
+            print(f"{RED}Failed to remove{RESET} {name}, which does belong to "
+                  f"{fp.name}: {err}", file=sys.stderr)
+        if undeletable:
+            # An entry that matched and survived means the command did not do
+            # what it was asked to do, so it must not report success.
+            sys.exit(1)
     else:
         if not args.force:
-            entries = list(CACHE_DIR.glob("*.json"))
+            entries = list(cdir.glob("*.json"))
             print(f"This will delete {len(entries)} cached parse results.")
             print(f"Use --force to confirm, or --file to clear a specific file.")
             sys.exit(1)
 
-        entries = list(CACHE_DIR.glob("*.json"))
+        entries = list(cdir.glob("*.json"))
+        # The same defect as the --file branch, in its other copy: this counted
+        # the entries it FOUND and called them cleared, and an OSError on any
+        # one of them aborted the sweep with a traceback and no summary at all,
+        # leaving the operator with no idea how many had gone.
+        cleared = 0
+        undeletable = []
         for entry in entries:
-            entry.unlink(missing_ok=True)
-        print(f"Cleared {len(entries)} cache entries.")
+            try:
+                entry.unlink(missing_ok=True)
+            except OSError as e:
+                undeletable.append((entry.name, str(e)))
+                continue
+            cleared += 1
+        print(f"Cleared {cleared} of {len(entries)} cache entries.")
+        for name, err in undeletable:
+            print(f"{RED}Failed to remove{RESET} {name}: {err}", file=sys.stderr)
+        if undeletable:
+            sys.exit(1)
 
 
 # ============================================================
