@@ -23,6 +23,10 @@ Public surface:
     The fences only: ``(yaml_block, body, kind)``, no YAML parsed. For callers
     with their own YAML policy.
 
+- ``split_frontmatter_raw(text)`` -> ``(Optional[str], str, str)``
+    The same split, byte-preserving: ``front + rest == text``. For a caller that
+    rewrites one half and emits the file again.
+
 - ``parse_frontmatter_strict(text)`` -> ``(Optional[Dict], str, str)``
     ``(data, kind, detail)``, keeping the REASON a document failed. The two
     variants above collapse every failure into ``({}, text)``, which is why
@@ -207,6 +211,108 @@ def split_frontmatter(text: str) -> Tuple[Optional[str], str, str]:
     return rest[:closing.start()], rest[closing.end():].lstrip("\r\n"), FM_OK
 
 
+def split_frontmatter_raw(text: str) -> Tuple[Optional[str], str, str]:
+    """The same split, byte-preserving: ``(front, rest, kind)`` with
+    ``front + rest == text`` whenever ``kind`` is ``FM_OK``.
+
+    ``split_frontmatter`` above drops the fence lines and strips the newlines
+    that follow the closing one, which is right for a caller that wants the YAML
+    and the prose. It is wrong for a caller that must REWRITE one half and emit
+    the file again: the dropped bytes would be silently normalised, so a fence
+    written ``---\\t`` or a body opening on a blank line would come back changed.
+
+    ``front`` is the opening fence line, the block, and the closing fence line,
+    each with its own line terminator. ``rest`` is everything after, verbatim,
+    including any leading blank lines. When there is no usable block, ``front``
+    is None and ``rest`` is *text* unchanged, so a caller can treat the whole
+    file as body without a second read.
+
+    Written for ``scripts/dev/build-plugins.py``, which applies a YAML-escaped
+    substitution to the frontmatter and a plain one to the body, then
+    concatenates. Its own regex ``\\A(---\\r?\\n.*?\\r?\\n---\\r?\\n)(.*)\\Z`` did
+    not accept a fence with trailing whitespace, so on such a file the whole
+    document took the BODY substitution: the plain form closes the
+    ``allowed-tools`` double-quoted scalar early and the bundle's frontmatter
+    stops being YAML. That is the defect ``_REWRITE_SUB_YAML`` exists to prevent,
+    reintroduced through the splitter instead of the substitution.
+    """
+    if not text:
+        return None, text, FM_NO_OPENING
+    first, sep, rest = text.partition("\n")
+    if not sep or not _FENCE_LINE.match(first):
+        return None, text, FM_NO_OPENING
+    closing = _FENCE_LINE.search(rest)
+    if closing is None:
+        return None, text, FM_NO_CLOSING
+    # The closing fence line ends where its own terminator ends, not where the
+    # match ends: `_FENCE_LINE` is anchored with `$`, so it stops BEFORE the
+    # newline. Consuming that newline here is what keeps `front + rest == text`
+    # without handing the body a leading blank line that was never in the file.
+    after = closing.end()
+    if rest.startswith("\r\n", after):
+        after += 2
+    elif rest.startswith("\n", after):
+        after += 1
+    cut = len(first) + len(sep) + after
+    return text[:cut], text[cut:], FM_OK
+
+
+def set_frontmatter_field(text: str, key: str, value: str) -> str:
+    """Set ``key: value`` inside the FRONTMATTER BLOCK, and nowhere else.
+
+    Returns *text* unchanged when the document has no usable block, so a caller
+    that wants to create one keeps that policy at its own call site: the two
+    callers today disagree about it, and hiding the disagreement in here would
+    give one of them the other's behaviour.
+
+    Everything outside the block is byte-for-byte identical, including the
+    fences, the line endings and any blank line opening the body. The reading
+    side already learned this lesson twice (see :func:`split_frontmatter` and
+    :func:`split_frontmatter_raw`); the WRITING side had not.
+
+    THE DEFECT THIS ENDS. Three functions in this workspace rewrite a field in
+    frontmatter and each spelled the scope itself. MEASURED 2026-08-29:
+
+      `crm_autolog.bump_last_touch_in_text` ran `^last_touch:` MULTILINE over the
+        WHOLE DOCUMENT before deciding to insert. Given a card with no
+        `last_touch` in frontmatter and any body line starting `last_touch:` --
+        a quoted email in the interaction log will do -- it rewrote the BODY
+        line, returned, and left frontmatter without the field. The write
+        succeeded, the audit log recorded `matched: true`, and `calculate_health`
+        went on reading the contact as never touched. Its docstring said the
+        insert "lands inside the frontmatter block or nowhere".
+      `transfer-contact.update_owner_in_frontmatter` scoped the edit correctly
+        and spelled its own fences, `^---\\s*\\n(.*?)\\n---\\s*\\n`. The trailing
+        `\\n` is required, so a card whose file ENDS at the closing fence matched
+        nothing and took the "no frontmatter" branch: it PREPENDED a second
+        block, and the card's real fields became body text.
+      `crm-health.frontmatter_end` had both defects, was fixed on its own, and
+        wrote the reason down. The fix never reached the other two.
+
+    The value is substituted through a callable, so a backslash or a ``\\1`` in
+    it cannot be read as a regex group reference.
+    """
+    front, rest, kind = split_frontmatter_raw(text)
+    if kind != FM_OK or front is None:
+        return text
+    open_line, sep, after_open = front.partition("\n")
+    closing = _FENCE_LINE.search(after_open)
+    if closing is None:          # unreachable while kind is FM_OK; not assumed
+        return text
+    block, tail = after_open[:closing.start()], after_open[closing.start():]
+
+    field = re.compile(rf"^{re.escape(key)}[ \t]*:.*$", re.MULTILINE)
+    if field.search(block):
+        block = field.sub(lambda _m: f"{key}: {value}", block, count=1)
+    else:
+        # `block` carries the newline before the closing fence, so an append
+        # needs no separator of its own. An EMPTY block (`---\n---\n`) is the
+        # one case that does not, and it needs none either.
+        newline = "\r\n" if block.endswith("\r\n") else "\n"
+        block = f"{block}{key}: {value}{newline}"
+    return open_line + sep + block + tail + rest
+
+
 def parse_frontmatter_strict(text: str) -> Tuple[Optional[Dict[str, Any]], str, str]:
     """Frontmatter with the failure REASON kept: ``(data, kind, detail)``.
 
@@ -315,6 +421,37 @@ _CONFIG_BLOCK_RE = re.compile(
     r"##\s*Config(?:uration)?\s*:?\s*\n(?P<block>(?:.*\n)*?)(?:\n##|\Z)",
     re.IGNORECASE,
 )
+
+
+def frontmatter_list(value: Any) -> List[str]:
+    """A frontmatter field that should be a list, as a list of strings.
+
+    `yaml.safe_load` returns native types, so a key written with no value at
+    all -- `keywords:` on its own line -- parses to None, and a key written as
+    one bare word parses to a string. Six readers spelled the coercion
+    themselves and five of them handled the string but not the None.
+
+    MEASURED 2026-08-29: one note with a bare `keywords:` made
+    `knowledge-health.py` die with `TypeError: 'NoneType' object is not
+    iterable` in all three of its output modes, and both health-check callers
+    (`scripts/memory.py`, `scripts/prime-health-parallel.py`) reported the
+    check as failed. `REQUIRED_FIELDS` tests key PRESENCE, so the note counted
+    as valid on the way in.
+
+    Beside `frontmatter_date` for the same reason: the coercion belongs once,
+    where every reader can find it, not once per reader.
+    """
+    if value is None or value == "":
+        return []
+    # The container test names its three types and does NOT say `Iterable`. A
+    # string is iterable, so a widened test would shatter `keywords: alpha`
+    # into `['a', 'l', 'p', 'h', 'a']`. A separate `isinstance(value, str)`
+    # branch used to sit above this and mutation showed it changed no answer
+    # (the tail below returns `[str(value)]`, which is the same list), so the
+    # dead branch is gone and the explicit tuple of types is the guard.
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value if v is not None]
+    return [str(value)]
 
 
 def parse_config(text: str, key: str) -> Optional[str]:
@@ -453,5 +590,3 @@ def parse_md_table(text: str, header_pattern: Optional[str] = None, *,
         rows.append({h: cells[j] if j < len(cells) else ""
                      for j, h in enumerate(headers)})
     return rows
-
-    return None

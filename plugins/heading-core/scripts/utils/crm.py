@@ -44,12 +44,14 @@ if str(_WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(_WORKSPACE_ROOT))
 
 from scripts.utils.workspace import (  # noqa: E402
+    get_context_dir,
     get_default_tz,
     get_crm_contacts_dir,
     get_corporate_root,
     is_exec_workspace,
 )
 from scripts.utils.markdown import parse_frontmatter_str as _parse_frontmatter  # noqa: E402
+from scripts.utils.markdown import frontmatter_list
 
 
 def try_commit(commit_fn, repo: Path, files, message: str, label: str) -> bool:
@@ -370,11 +372,41 @@ def scan_contacts(config: dict, today=None, contacts_dir: Path | None = None,
         contacts_dir = get_crm_contacts_dir()
 
     # Phase 2.4: load pipeline stages + aliases once for stage-aware cadence.
-    # Resolve paths relative to workspace_root (test fixture support) or the
-    # canonical workspace root when called in production.
-    _ws_root = Path(workspace_root) if workspace_root else _WORKSPACE_ROOT
-    _stages = parse_pipeline_stages(_ws_root / "context" / "pipeline.md")
-    _aliases = parse_aliases(_ws_root / "crm" / "aliases.md")
+    #
+    # Through the DATA-ROOT SEAM, not `_WORKSPACE_ROOT`. That constant is the
+    # ENGINE clone root, computed at import from `__file__`, and the comment
+    # here used to call it "the canonical workspace root when called in
+    # production". On the split engine/data topology it is not: `pipeline.md`
+    # and `aliases.md` are operator data and live in the overlay. Both reads
+    # therefore resolved to paths that do not exist, `parse_*` returned empty
+    # dicts, and stage-aware cadence has never once applied in production.
+    #
+    # Measured 2026-08-29 against the real tree:
+    #   engine context/pipeline.md exists: False   data: True
+    #   engine crm/aliases.md      exists: False   data: True
+    #   stages from the ENGINE path: 0    from the DATA path: 29
+    #   aliases from the ENGINE path: 0   from the DATA path: 61
+    #   28 of those 29 rows carry a stage that maps to a STAGE_CADENCE entry
+    #   (9 Demo/POC at 7 days, 3 Negotiation at 3, 10 Qualified, 6 Lead)
+    # so every one of them fell back to the contact-type default and went
+    # yellow and red days late. `STAGE_CADENCE["Won"] = 0`, the stop-tracking
+    # signal, was unreachable from the pipeline side, so closed accounts kept
+    # accruing red debt and feeding `/cold-sweep`'s outreach drafting.
+    #
+    # `census_oracles.py` reads the same two files through its corpus paths and
+    # was right all along. This is the second copy.
+    #
+    # `workspace_root` keeps its exact meaning: a fixture override. Only the
+    # FALLBACK changed, so every existing caller that passes it is unaffected.
+    if workspace_root:
+        _ws_root = Path(workspace_root)
+        _pipeline_file = _ws_root / "context" / "pipeline.md"
+        _aliases_file = _ws_root / "crm" / "aliases.md"
+    else:
+        _pipeline_file = get_context_dir() / "pipeline.md"
+        _aliases_file = get_crm_contacts_dir().parent / "aliases.md"
+    _stages = parse_pipeline_stages(_pipeline_file)
+    _aliases = parse_aliases(_aliases_file)
 
     contacts: list = []
     tribe_warnings: list = []
@@ -611,6 +643,61 @@ def resolve_entity_ref(relationship_record: dict, workspace_root: Path | None = 
     return load_entity(slug, workspace_root=workspace_root)
 
 
+def contact_index_by_email(contacts_dir: Path | None = None,
+                           workspace_root: Path | None = None) -> dict[str, dict]:
+    """Lower-cased email address to its merged contact record, for every card.
+
+    THE ONE PLACE that answers "which contact owns this address". A card holds
+    the address in either of two shapes and a reader must handle both:
+
+      legacy   `email: someone@example.test` inline in the contact card
+      entity   `entity_ref: some-slug`, with the address at
+               `crm/address-book/some-slug.md::canonical_email`
+
+    The entity shape is what `/crm` add-contact writes and what
+    `crm_migrate_to_entity_model.py --apply` rewrites cards into, so it is the
+    current schema, not an exotic one. Measured on the operator's tree
+    2026-08-29: of 169 cards, 89 inline an address and 80 do not; 59 addresses
+    that `scan_contacts` resolves are reachable ONLY through the entity.
+
+    `scripts/inbox_pulse/rules.py` carried two copies of a walk that read the
+    inline key alone, and this function exists so there is no third. Written as
+    an INDEX rather than a per-address lookup because both callers ask about
+    many addresses over one run, and the old shape reopened all 169 cards per
+    question.
+
+    Parity with `merge_entity_and_relationship` is deliberate: the entity's
+    `other_emails` list is NOT indexed, because the canonical reader does not
+    use it either and one reader disagreeing with another about who owns an
+    address is the defect this replaces. It is also empty on every one of the
+    165 address-book entities today, so indexing it would be speculative.
+    Widening both readers together is a separate, deliberate change.
+    """
+    if contacts_dir is None:
+        contacts_dir = get_crm_contacts_dir()
+    index: dict[str, dict] = {}
+    if not Path(contacts_dir).is_dir():
+        return index
+
+    for card in sorted(Path(contacts_dir).glob("*.md")):
+        try:
+            relationship, _body = _parse_frontmatter(card.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if not relationship:
+            continue
+        entity = resolve_entity_ref(relationship, workspace_root=workspace_root)
+        merged = merge_entity_and_relationship(entity, relationship)
+        # Inline wins when both are present: it is the per-relationship view,
+        # and `merge_entity_and_relationship` already gives the entity's
+        # `canonical_email` to `merged["email"]` when there is no inline one.
+        address = str(relationship.get("email") or merged.get("email") or "").strip()
+        if not address:
+            continue
+        index.setdefault(address.lower(), merged)
+    return index
+
+
 def merge_entity_and_relationship(entity: dict, relationship: dict) -> dict:
     """Merge biographical facts from entity with per-exec view from relationship.
 
@@ -639,7 +726,20 @@ def merge_entity_and_relationship(entity: dict, relationship: dict) -> dict:
     if entity:
         merged["name"] = entity.get("name", "")
         merged["company"] = entity.get("employer", "")
-        merged["email"] = entity.get("canonical_email", "")
+        # Fall back to the card's inline address when the entity carries none.
+        # The migration is supposed to move the address onto the entity, and on
+        # four live contacts it did not: the address-book record exists, its
+        # `canonical_email` is empty, and the real address is still sitting on
+        # the relationship card. Taking the entity's value unconditionally
+        # reported those four as having NO email at all, to CRM health, the
+        # dashboard, `aggregate-crm` and `/cold-sweep`, which drafts outreach
+        # and would have had nowhere to send it. Measured 2026-08-29:
+        # four cards, every one `entity_found=True canonical_email=''`.
+        #
+        # The entity still WINS when it has a value, so the two-tier model is
+        # unchanged; this only stops an empty entity field erasing an address
+        # the workspace already knows.
+        merged["email"] = entity.get("canonical_email", "") or relationship.get("email", "")
         merged["linkedin"] = entity.get("linkedin", "")
         merged["telegram"] = entity.get("telegram", "")
         merged["phone"] = entity.get("phone", "")
@@ -652,7 +752,11 @@ def merge_entity_and_relationship(entity: dict, relationship: dict) -> dict:
     merged["cadence"] = relationship.get("cadence", "")
     merged["status"] = relationship.get("status", "active")
     merged["source"] = relationship.get("source", "")
-    merged["tags"] = relationship.get("tags", [])
+    # `frontmatter_list`, not a `[]` default: a card written with a bare
+    # `tags:` parses to None through yaml.safe_load, and the default only
+    # applies when the key is ABSENT. Every reader of merged["tags"] then
+    # iterates None.
+    merged["tags"] = frontmatter_list(relationship.get("tags"))
     merged["entity_ref"] = relationship.get("entity_ref", "")
     merged["pipeline_company"] = relationship.get("pipeline_company", "")
     merged["radar_freeze_until"] = relationship.get("radar_freeze_until", "")
