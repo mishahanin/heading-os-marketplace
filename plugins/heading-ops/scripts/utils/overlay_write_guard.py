@@ -84,7 +84,39 @@ _WATCH_BEFORE = None
 # recording costs nothing and turns "the overlay changed and nothing can say who"
 # into a short suspect list. Capped, because a 19,000-test suite spawns a lot.
 _CHILD_SPAWNS: list[tuple[str, str]] = []
+
+# How many children reached the live overlay, counted WITHOUT the cap that
+# bounds the example list. The two were one number until 2026-09-03, and the
+# report printed "200 child process(es) ran with the live data root reachable"
+# when 200 was `_CHILD_SPAWN_CAP` and the true figure was unknown and larger. A
+# ceiling presented as a count is the same defect the surrounding message has:
+# stating more than the method established.
+_CHILD_SPAWN_COUNT = 0
 _CHILD_SPAWN_CAP = 200
+
+# Per-test attribution: nodeid -> [count, one example command]. The flat example
+# list above is capped at 200 records, so under `-n auto` it fills with whatever
+# the FIRST 200 spawns were and says nothing about the other ten thousand.
+# MEASURED 2026-09-04: a full sharded run reported 10069 reachable children and
+# every one of the 16 printed examples was `<unknown test> -> .venv/bin/python -u
+# -c import sys;exec(...)`, the execnet bootstrap of the xdist workers -- because
+# the CONTROLLER is the only process whose examples the report ever saw, and the
+# controller spawns nothing but workers. 99.8% of the enforced number had no
+# nodeid, no command, and no way to act on it.
+#
+# A dict keyed by nodeid is bounded by the number of DISTINCT spawning tests
+# rather than by the spawn count, which is the shape that survives ten thousand
+# spawns from a few hundred tests. It is capped anyway, because nothing
+# guarantees that ratio.
+#
+# THE HONEST LIMIT: past the cap, a nodeid that has never been seen before is
+# counted in `_CHILD_SPAWN_COUNT` and dropped from this map, tallied in
+# `_CHILD_SPAWN_UNATTRIBUTED`. The map is therefore a lower bound per test and a
+# possibly-incomplete list of tests. The example command is the FIRST one seen
+# for that nodeid, not a summary of all of them.
+_CHILD_SPAWNS_BY_TEST: dict[str, list] = {}
+_CHILD_SPAWN_BY_TEST_CAP = 2000
+_CHILD_SPAWN_UNATTRIBUTED = 0
 
 # Wall-clock moment `_WATCH_BEFORE` was taken. Recorded because the overlay is a
 # LIVE tree: a concurrent agent, a daemon or the operator can create a file in it
@@ -132,12 +164,69 @@ def _structural_overlay_root():
     unwatched; that is a known gap, reported rather than silently widened here,
     because bringing them in changes which writes a run is allowed to make.
     """
-    engine = Path(__file__).resolve().parents[2]
+    engine = _main_clone_root(Path(__file__).resolve().parents[2])
     sibling = engine.parent / ".heading-os-data"
     try:
         return sibling.resolve() if sibling.is_dir() else None
     except OSError:
         return None
+
+
+def _main_clone_root(engine):
+    """`engine` when it is the main clone, else the main clone it belongs to.
+
+    The sibling-overlay rule above holds for the MAIN clone and for nothing
+    else. A git worktree lives wherever it was created: this repository's YARDs
+    sit at `<workspaces>/.yard/.heading-os/<task>`, three levels away from the
+    overlay, so `engine.parent / ".heading-os-data"` names a directory that has
+    never existed.
+
+    MEASURED 2026-09-03 in the YARD at `.yard/.heading-os/test-123`:
+    `_structural_overlay_root()` returned None, `_watched_roots()` was empty,
+    and `arm_process_wide()` therefore wrapped nothing while reporting itself
+    armed. Five tests in
+    `tests/test_a_guard_that_armed_under_pytest_and_nowhere_else.py` prove it
+    and had been SKIPPED, because the `.pth` they require is removed by
+    `uv sync` and the bootstrap never put it back -- so the suite could not say
+    it either. Every YARD on this machine ran unguarded, and the report said
+    otherwise. CLAUDE.md § HELM and YARD states the rule this broke: derive the
+    tree from the current checkout, never from a constant.
+
+    Import-free on purpose, like its caller. This runs from a `.pth` during
+    `site.py`, and importing anything under `scripts.` there binds the name
+    `scripts` in `sys.modules` for the whole interpreter -- the defect that put
+    62 tests red on 2026-08-31 and the reason `_structural_overlay_root` walks
+    `__file__` instead of calling `get_data_root()`. `git rev-parse` is not
+    available either: no subprocess at interpreter startup.
+
+    So the link is read the way git writes it. A worktree's `.git` is a FILE
+    holding `gitdir: <main>/.git/worktrees/<name>`; the main clone's `.git` is a
+    directory. Anything unexpected returns `engine` unchanged, which is the
+    previous behaviour and fails toward the public-clone case rather than toward
+    a stranger's directory.
+    """
+    dotgit = engine / ".git"
+    try:
+        if dotgit.is_dir() or not dotgit.is_file():
+            return engine
+        text = dotgit.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return engine
+    if not text.startswith("gitdir:"):
+        return engine
+    gitdir = Path(text[len("gitdir:"):].strip())
+    if not gitdir.is_absolute():
+        # `normpath`, not `resolve`. The `..` segments have to go, or `parents`
+        # below counts them as components and returns a path spelled through
+        # the worktree it was supposed to leave. `resolve` would also follow
+        # symlinks, and a repository reached through one is still that
+        # repository; the question here is spelling, not identity.
+        gitdir = Path(os.path.normpath(engine / gitdir))
+    # <main>/.git/worktrees/<name>  ->  <main>
+    parents = gitdir.parents
+    if len(parents) < 3 or parents[0].name != "worktrees" or parents[1].name != ".git":
+        return engine
+    return parents[2]
 
 
 def _overlay_root():
@@ -812,14 +901,28 @@ def _install_overlay_write_guard():
         return any(prefix.rstrip(os.sep) in pinned for prefix in _OVERLAY_PREFIXES)
 
     def _record_spawn(cmd, kwargs):
-        if len(_CHILD_SPAWNS) >= _CHILD_SPAWN_CAP:
-            return
+        global _CHILD_SPAWN_COUNT, _CHILD_SPAWN_UNATTRIBUTED
         try:
             if not _child_reaches_live_overlay(kwargs):
                 return
+            _CHILD_SPAWN_COUNT += 1
             head = " ".join(str(a) for a in cmd)[:120] if isinstance(cmd, (list, tuple)) \
                 else str(cmd)[:120]
             nodeid = os.environ.get("PYTEST_CURRENT_TEST", "<unknown test>").split(" (")[0]
+            # Attribution BEFORE the example cap, and that ordering is the fix.
+            # `_CHILD_SPAWNS` fills at 200 and then records nothing, so under
+            # `-n auto` the report described the first 200 spawns of the
+            # controller and none of the workers' ten thousand.
+            entry = _CHILD_SPAWNS_BY_TEST.get(nodeid)
+            if entry is not None:
+                entry[0] += 1
+            elif len(_CHILD_SPAWNS_BY_TEST) < _CHILD_SPAWN_BY_TEST_CAP:
+                _CHILD_SPAWNS_BY_TEST[nodeid] = [1, head]
+            else:
+                _CHILD_SPAWN_UNATTRIBUTED += 1
+            # The cap bounds the EXAMPLES kept, never the count above.
+            if len(_CHILD_SPAWNS) >= _CHILD_SPAWN_CAP:
+                return
             _CHILD_SPAWNS.append((nodeid, head))
         except Exception:  # noqa: BLE001 - a diagnostic must never break a run
             return
@@ -1032,6 +1135,69 @@ def _installed_owner():
     return getattr(builtins.open, _OWNER_ATTR, None)
 
 
+def _carry_spawn_count(extra: int) -> None:
+    """Add a displaced copy's reachable-child count to this one's.
+
+    A function rather than an inline `+=` inside `arm()`, and that is not
+    style. An augmented assignment to a module global inside a function makes
+    the name LOCAL for that whole function, so `arm()` raised UnboundLocalError
+    on its first read and every caller of the guard silently stopped arming.
+    MEASURED 2026-09-03: nine tests went red, including the one that drives a
+    real refused write, and the guard reported nothing at all.
+    """
+    global _CHILD_SPAWN_COUNT
+    _CHILD_SPAWN_COUNT += extra
+
+
+def top_spawners(limit=10, source=None):
+    """`(nodeid, example command, count)` for the busiest spawners, most first.
+
+    `source` defaults to this process's own map. The controller of a sharded
+    run passes the aggregate it built from the workers' reports, because its
+    own map holds nothing but the execnet bootstrap of the workers themselves.
+
+    Ties break on nodeid so the same run twice prints the same order; without
+    it a reader diffing two reports sees churn that means nothing.
+    """
+    if source is None:
+        source = _CHILD_SPAWNS_BY_TEST
+    ranked = sorted(source.items(), key=lambda kv: (-kv[1][0], kv[0]))
+    return [(nodeid, entry[1], entry[0]) for nodeid, entry in ranked[:limit]]
+
+
+def merge_spawn_attribution(entries, unattributed=0, into=None):
+    """Fold `(nodeid, example command, count)` triples into an attribution map.
+
+    Used twice, and both callers matter. `arm()` folds a displaced module
+    copy's map into this one, the same handover `_carry_spawn_count` performs
+    for the bare total. `tests/conftest.py` folds each xdist worker's report
+    into the controller's aggregate.
+
+    THE LIMIT, which is the whole reason this takes counts rather than events:
+    what arrives from a worker is already the worker's TOP slice, not its whole
+    map, so the aggregate is a lower bound per test and cannot see a test that
+    spawned a few children on every one of eight workers. It is built to name
+    the heavy spawners, which is what a repair needs, and it will not name the
+    long tail. `_CHILD_SPAWN_COUNT` remains the only complete number.
+    """
+    global _CHILD_SPAWN_UNATTRIBUTED
+    target = _CHILD_SPAWNS_BY_TEST if into is None else into
+    for nodeid, cmd, count in entries:
+        entry = target.get(nodeid)
+        if entry is not None:
+            entry[0] += count
+        elif len(target) < _CHILD_SPAWN_BY_TEST_CAP:
+            target[nodeid] = [count, cmd]
+        else:
+            # Over the cap, whichever map this is. Counted, never silent: an
+            # attribution list that quietly drops rows is the report claiming
+            # coverage it does not have, which is the defect this whole file
+            # is a repair for.
+            _CHILD_SPAWN_UNATTRIBUTED += count
+    _CHILD_SPAWN_UNATTRIBUTED += unattributed
+    return target
+
+
 def arm(mode=None, snapshot=None, structural_only=False):
     """Install the wrappers, and optionally take the before-snapshot.
 
@@ -1158,6 +1324,11 @@ def arm(mode=None, snapshot=None, structural_only=False):
         owner["_OVERLAY_PREFIXES"] = ()
         # Spawns recorded before the handover are still suspects, so carry them.
         _CHILD_SPAWNS.extend(owner.get("_CHILD_SPAWNS") or ())
+        _carry_spawn_count(owner.get("_CHILD_SPAWN_COUNT") or 0)
+        merge_spawn_attribution(
+            [(nodeid, entry[1], entry[0]) for nodeid, entry
+             in (owner.get("_CHILD_SPAWNS_BY_TEST") or {}).items()],
+            unattributed=owner.get("_CHILD_SPAWN_UNATTRIBUTED") or 0)
     # Install ONCE per process. A second `arm()` refreshes the mode, the prefixes
     # and the snapshot, and deliberately does NOT wrap again. Two layers of
     # wrappers is not a cosmetic problem: `restore()` unwinds exactly one, so the
@@ -1244,10 +1415,11 @@ def watch_complaints(before, after):
             n for n in set(snapshot) & set(now)
             if snapshot[n] is not None and snapshot[n] != now[n]
         )
-        for what, names in (("appeared", added), ("vanished", removed), ("rewrote", resized)):
+        for what, names in (("appeared", added), ("vanished", removed), ("changed", resized)):
             if names:
                 complaints.append(
-                    f"{len(names)} file(s) {what} in the operator's live {label} "
-                    f"at {directory} during the run: {names[:5]}"
+                    f"{len(names)} file(s) {what} under the operator's live "
+                    f"{label} at {directory} between the start and the end of "
+                    f"the run: {names[:5]}"
                 )
     return complaints
